@@ -37,7 +37,12 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -199,27 +204,30 @@ class TEEAttestation:
             "Intel TDX, or IBM Secure Execution. Bare metal and non-TEE VMs are not supported."
         )
 
-    def fetch_attestation_report(self, nonce: bytes = b"") -> bytes:
+    def fetch_attestation_report(self, nonce: bytes = b"", report_data: bytes = b"") -> bytes:
         """Fetch a real SEV-SNP attestation report from /dev/sev-guest.
         
-        Returns raw 1184-byte attestation report. This is a signed quote from the
-        AMD Platform Security Processor (PSP) containing:
+        report_data (64 bytes): arbitrary data embedded in the signed attestation
+        report. For key-release protocol, this is hash(ephemeral_pubkey || nonce || policy).
+        
+        Returns raw 1184-byte attestation report — a signed quote from the AMD PSP:
           - Guest measurement (SHA-384 of initial memory + firmware)
-          - Platform version, chip ID, VMPL
-          - Report data (we deposit our nonce here for freshness)
+          - Platform version, chip ID, VMPL  
+          - report_data field (our deposited nonce + pubkey hash)
           - AMD-signed certificate chain
         """
         tee = self.detect()
         if tee == "sev-snp":
-            return self._fetch_sev_snp_report(nonce)
+            return self._fetch_sev_snp_report(nonce, report_data)
         if tee == "tdx":
-            return self._fetch_tdx_quote(nonce)
+            return self._fetch_tdx_quote(nonce, report_data)
         raise AttestationError(f"unsupported TEE: {tee}")
 
-    def _fetch_sev_snp_report(self, nonce: bytes) -> bytes:
-        report_data = nonce.ljust(64, b"\x00")[:64]
-        vmpl = b"\x00" * 64  # VMPL 0 = guest owner
-        request = SEV_SNP_REPORT_REQ.pack(report_data, vmpl)
+    def _fetch_sev_snp_report(self, nonce: bytes, report_data: bytes = b"") -> bytes:
+        # SEV-SNP report_data = 64 bytes. Pack: nonce (32B) + report_data (32B)
+        rd = (nonce + report_data).ljust(64, b"\x00")[:64]
+        vmpl = b"\x00" * 64
+        request = SEV_SNP_REPORT_REQ.pack(rd, vmpl)
         with open(SEV_GUEST_DEVICE, "rb+", buffering=0) as f:
             f.write(request)
             resp_raw = f.read(SEV_SNP_REPORT_RESP.size)
@@ -229,7 +237,7 @@ class TEEAttestation:
         actual_size = min(size_field, 1184)
         return report[:actual_size]
 
-    def _fetch_tdx_quote(self, nonce: bytes) -> bytes:
+    def _fetch_tdx_quote(self, nonce: bytes, report_data: bytes = b"") -> bytes:
         raise AttestationError(
             "Intel TDX guest attestation requires Intel SGX DCAP quoting library. "
             "Open a TDX guest device and use Intel QE/QVE to request a TD quote. "
@@ -268,18 +276,34 @@ class TEEAttestation:
         self._report_raw = report
 
     def verify_via_key_service(self, report: bytes, key_service_url: str,
-                               nonce: bytes) -> Tuple[bytes, bytes]:
-        """Send attestation report to external key-release service for verification.
-        The service returns: (session_key: bytes, measurement: bytes)."""
-        # Production: POST report + nonce to key_service_url over mTLS
-        # The service verifies certificate chain, measurement, policy
-        # and releases the session key only after ALL checks pass.
-        # This is the recommended production path.
+                               nonce: bytes, ephemeral_pubkey: bytes) -> Tuple[bytes, bytes]:
+        """Ephemeral-key protocol: KRS wraps CEK to VM's ephemeral public key.
+
+        1. VM generates ephemeral X25519 key pair — private key never leaves VM
+        2. VM embeds hash(pubkey || nonce) in SEV-SNP report_data
+        3. VM sends attestation report + pubkey to KRS over mTLS
+        4. KRS verifies:
+           a. AMD VCEK certificate chain → ARK root
+           b. Measurement matches allowlist  
+           c. Nonce fresh (anti-replay)
+           d. report_data contains hash(pubkey || nonce) — binds to THIS VM
+           e. Nitrokey TOUCH authorizes key release
+        5. KRS wraps content-encryption-key to ephemeral_pubkey via ECDH
+        6. KRS returns: (wrapped_cek: bytes, measurement: bytes)
+        7. VM unwraps CEK with ephemeral private key — discards key pair
+        
+        The CEK is ephemeral — valid only for this attestation session.
+        The Nitrokey hmac-secret never leaves the KRS. Replay impossible
+        because nonce is fresh and bound to the attestation report.
+        
+        Returns: (wrapped_cek, measurement)
+        """
         import urllib.request
         body = json.dumps({
             "report": report.hex(),
             "nonce": nonce.hex(),
             "tee_type": self.tee_type,
+            "ephemeral_pubkey": ephemeral_pubkey.hex(),  # public key — not secret
         }).encode()
         req = urllib.request.Request(key_service_url, data=body,
                                      headers={"Content-Type": "application/json"})
@@ -287,7 +311,7 @@ class TEEAttestation:
         result = json.loads(resp.read())
         if not result.get("verified"):
             raise AttestationError(f"Key service rejected attestation: {result.get('reason')}")
-        return bytes.fromhex(result["session_key"]), bytes.fromhex(result["measurement"])
+        return bytes.fromhex(result["wrapped_cek"]), bytes.fromhex(result["measurement"])
 
 
 # ── 4. FIDO2 hmac-secret via proper libfido2 protocol ────────────────────────
@@ -509,7 +533,16 @@ class CloudProtection:
         self._master_key: Optional[ProtectedMemory] = None
 
     def bootstrap(self) -> int:
-        """7-step bootstrap sequence. Returns 0 on success, 1 on failure."""
+        """Bootstrap sequence. Returns 0 on success, 1 on failure.
+        
+        Key-release-service path (production):
+          VM → generate X25519 key pair → embed pubkey hash in attestation report
+          VM → send report to KRS → KRS verifies + wraps CEK to pubkey
+          VM → unwrap CEK with private key → decrypt strategy
+        
+        Local-verify path (development only):
+          Uses expected_measurement + local Nitrokey hmac-secret.
+        """
         try:
             # Step 1: Detect TEE
             logging.info("Step 1/7: Detecting TEE...")
@@ -517,52 +550,106 @@ class CloudProtection:
             tee_type = attestation.detect()
             logging.info("  TEE: %s", tee_type)
 
-            # Step 2: Fetch attestation report with fresh nonce
-            logging.info("Step 2/7: Fetching attestation report...")
+            # Step 2: Generate ephemeral key pair (for KRS path)
+            ephemeral_privkey: Optional[X25519PrivateKey] = None
+            ephemeral_pubkey_bytes: bytes = b""
+            
+            # Step 3: Fetch attestation report
             nonce = secrets.token_bytes(32)
-            report = attestation.fetch_attestation_report(nonce)
-            logging.info("  Report: %d bytes", len(report))
-
-            # Step 3: Verify attestation (local or via key service)
-            logging.info("Step 3/7: Verifying attestation...")
             if self._key_service_url:
-                logging.info("  Using external key-release service: %s", self._key_service_url)
-                session_key, measurement = attestation.verify_via_key_service(
-                    report, self._key_service_url, nonce
+                # KRS path: embed hash(ephemeral_pubkey || nonce) in report_data
+                ephemeral_privkey = X25519PrivateKey.generate()
+                ephemeral_pubkey_bytes = ephemeral_privkey.public_key().public_bytes(
+                    encoding=serialization.Encoding.Raw, 
+                    format=serialization.PublicFormat.Raw
                 )
-                logging.info("  Key service verified: measurement=%s", measurement[:8].hex())
+                pubkey_hash = hashlib.sha256(ephemeral_pubkey_bytes + nonce).digest()
+                logging.info("Step 2/8: Ephemeral key pair generated (X25519)")
+                report = attestation.fetch_attestation_report(nonce, report_data=pubkey_hash)
+            else:
+                logging.info("Step 2/8: No KRS — using local verify path")
+                report = attestation.fetch_attestation_report(nonce)
+            
+            logging.info("Step 3/8: Attestation report: %d bytes", len(report))
+
+            # Step 4: Verify attestation (KRS or local)
+            if self._key_service_url:
+                logging.info("Step 4/8: Sending to key-release service...")
+                logging.info("  KRS URL: %s", self._key_service_url)
+                wrapped_cek, measurement = attestation.verify_via_key_service(
+                    report, self._key_service_url, nonce, ephemeral_pubkey_bytes
+                )
+                logging.info("  KRS verified: measurement=%s", measurement[:8].hex())
+                
+                # Step 5: Unwrap CEK with ephemeral private key
+                logging.info("Step 5/8: Unwrapping CEK with ephemeral private key...")
+                # ECDH: shared_secret = privkey * pubkey_KRS (NOT needed — KRS wrapped to OUR pubkey)
+                # The KRS wrapped CEK to OUR ephemeral pubkey using HPKE or ECDH+AEAD.
+                # For this reference implementation, KRS uses ECDH(X25519):
+                #   shared = X25519(KRS_ephemeral_priv, VM_ephemeral_pub)
+                #   wrapped_cek = AES-GCM(CEK, key=HKDF(shared))
+                # VM unwraps:
+                #   shared = X25519(VM_ephemeral_priv, KRS_ephemeral_pub)
+                # KRS ephemeral pubkey is included in wrapped_cek prefix (first 32 bytes)
+                krs_pubkey_bytes = wrapped_cek[:32]
+                krs_pubkey = X25519PublicKey.from_public_bytes(krs_pubkey_bytes)
+                shared_secret = ephemeral_privkey.exchange(krs_pubkey)
+                cek_wrapped = wrapped_cek[32:]
+                
+                # Derive unwrapping key from shared secret
+                uwk = HKDF(algorithm=hashes.SHA512(), length=32, salt=b"",
+                           info=b"hpvs-ecdhe-wrap/v1").derive(shared_secret)
+                
+                # Unwrap CEK: salt(16) + nonce(12) + AES-GCM(CEK)
+                # (same format as aes_gcm_seal/aes_gcm_open)
+                unwrap_salt = cek_wrapped[:16]
+                unwrap_nonce = cek_wrapped[16:28]
+                unwrap_ct = cek_wrapped[28:]
+                uwk_sub = HKDF(algorithm=hashes.SHA512(), length=32, salt=unwrap_salt,
+                               info=b"hpvs-cek-unwrap/v1").derive(uwk)
+                aes = AESGCM(uwk_sub)
+                cek = aes.decrypt(unwrap_nonce, unwrap_ct, b"hpvs-cek")
+                
+                # Store CEK in ProtectedMemory
+                self._master_key = ProtectedMemory(32)
+                self._master_key.write(cek, 0)
+                
+                # Discard ephemeral key pair
+                ephemeral_privkey = None
+                ephemeral_pubkey_bytes = b"\x00" * 32
+                logging.info("  CEK unwrapped. Ephemeral keys discarded.")
+                
             elif self._expected_measurement:
+                logging.info("Step 4/8: Local attestation verification...")
                 attestation.verify_attestation_report(report, self._expected_measurement, nonce)
                 measurement = attestation.measurement
-                logging.info("  Local verification: measurement match confirmed")
+                logging.info("  Measurement match confirmed")
+                
+                # Local path: derive master key from measurement + Nitrokey hmac-secret
+                logging.info("Step 5/8: Nitrokey FIDO2 — TOUCH REQUIRED")
+                nitrokey = NitrokeyRoT(self._cred_dir)
+                nitrokey.detect()
+                nitrokey.load_credential()
+                hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
+                logging.info("  hmac-secret derived (%d bytes)", len(hmac_secret))
+                
+                self._master_key = derive_master_key(measurement, hmac_secret)
+                logging.info("  Master key: ProtectedMemory (%d bytes)", self._master_key.size)
             else:
                 raise AttestationError(
                     "No expected measurement or key service URL provided. "
                     "Cannot verify attestation. Provide --expected-measurement or --key-service-url."
                 )
 
-            # Step 4: Derive Nitrokey hmac-secret (touch required)
-            logging.info("Step 4/7: Nitrokey FIDO2 — TOUCH REQUIRED")
-            nitrokey = NitrokeyRoT(self._cred_dir)
-            nitrokey.detect()
-            nitrokey.load_credential()
-            hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
-            logging.info("  hmac-secret derived (%d bytes)", len(hmac_secret))
-
-            # Step 5: Derive master key (TEE measurement + Nitrokey secret)
-            logging.info("Step 5/7: Deriving master key...")
-            self._master_key = derive_master_key(measurement, hmac_secret)
-            logging.info("  Master key: ProtectedMemory (%d bytes)", self._master_key.size)
-
             # Step 6: Decrypt strategy package
-            logging.info("Step 6/7: Decrypting strategy package...")
+            logging.info("Step 6/8: Decrypting strategy package...")
             n = decrypt_package(self._sealed_dir, self._master_key, self._output_dir)
             logging.info("  Decrypted %d files", n)
             if n == 0:
                 raise AttestationError("No .aesgcm files found in sealed directory")
 
             # Step 7: Arm zeroizer + start continuous attestation
-            logging.info("Step 7/7: Arming zeroizer + starting continuous attestation...")
+            logging.info("Step 7/8: Arming zeroizer + starting continuous attestation...")
             self._zeroizer.arm()
             monitor = ContinuousAttestationMonitor(self._zeroizer, attestation, measurement)
             monitor.start()
