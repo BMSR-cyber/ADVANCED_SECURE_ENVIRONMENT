@@ -1,128 +1,88 @@
 # ADVANCED SECURE ENVIRONMENT
 
-> **BMSR-cyber** — Production-grade confidential computing for autonomous trading infrastructure.
+> **BMSR-cyber** — Confidential computing reference architecture for autonomous trading.
+>
+> **Status:** v3 staging candidate. Not production-hardened. See [Remaining Hardening](#remaining-hardening).
 
 Replicates IBM Hyper Protect Virtual Servers (HPVS v2.1) security guarantees on
-accessible cloud hardware — GCP N2D (AMD SEV-ES), OCI Ampere A1 (free tier),
-and eventually Intel TDX — with **Nitrokey FIDO2 as the human root-of-trust**.
+accessible cloud hardware using AMD SEV-SNP + external key-release service +
+Nitrokey FIDO2 as human root-of-trust.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              CLOUD VM (GCP N2D / OCI Ampere)            │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │            AMD SEV-ES ENCRYPTED GUEST               │  │
-│  │  ┌─────────────────────────────────────────────┐   │  │
-│  │  │  TRADING BOT (9-strategy portfolio)          │   │  │
-│  │  │  ┌───────┐ ┌──────────┐ ┌───────────────┐   │   │  │
-│  │  │  │Signal │ │ Goldman  │ │ Circuit       │   │   │  │
-│  │  │  │Engine │→│Execution │→│ Breakers      │   │   │  │
-│  │  │  └───────┘ └──────────┘ └───────────────┘   │   │  │
-│  │  │  Memory encrypted at CPU boundary             │   │  │
-│  │  └─────────────────────────────────────────────┘   │  │
-│  └───────────────────────────────────────────────────┘  │
-│                          ▲                               │
-│                   SEV attestation                        │
-│                          │                               │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  Keylime Continuous Attestation (PCR polling)      │  │
-│  │  • Verifies platform integrity every 5 min        │  │
-│  │  • Zeroizes secrets on attestation failure        │  │
-│  │  • Reports to remote verifier                     │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-                          │
-                    Nitrokey FIDO2
-              (human root-of-trust)
-         hmac-secret → master encryption key
-         PIN-gated, physical touch required
+SIGNED CONTAINER IMAGE → SEV-SNP CONFIDENTIAL VM → ATTESTATION REPORT
+     → EXTERNAL KEY-RELEASE SERVICE (TEE + Nitrokey) → WRAPPED CEK
+     → DECRYPT STRATEGY INSIDE TEE → EMIT SIGNED ORDER INTENTS
+     → cTrader/MT5/Freqtrade DUMB EXECUTOR
 ```
 
 ## Security Guarantees (mapped from IBM HPVS)
 
 | HPVS Feature | Our Implementation | Mechanism |
 |:---|:---|:---|
-| Workload isolation from OS/hypervisor | AMD SEV-ES memory encryption | CPU-bound page tables encrypted, hypervisor cannot read |
-| Multi-party encrypted contract | Nitrokey + SEV attestation + Keylime | 3 anchors: human, hardware, continuous |
-| Key binding to guest identity | HKDF-SHA512(attestation_hash + fido2_secret) | Keys derivable ONLY inside measured VM |
-| Metadata secret injection | SEV LAUNCH_SECRET or Keylime key broker | Config released only after attestation |
-| LUKS data-at-rest protection | cryptsetup LUKS2 with TEE-derived passphrase | Disk data encrypted at rest |
-| Continuous attestation | Keylime 5-min PCR polling | TPM PCR state monitored |
-| Failsafe zeroization | ctypes mlock + madvise(MADV_DONTDUMP) | Secrets in non-swappable, non-core-dump memory |
-| Process obfuscation | prctl(PR_SET_NAME) to generic name | In-memory process name replaced |
+| Workload isolation from OS/hypervisor | AMD SEV-SNP | CPU-bound page tables encrypted |
+| Multi-party encrypted contract | TEE attestation + KRS + Nitrokey | 3 anchors: hardware, service, human |
+| Key binding to guest identity | ECDH(X25519) ephemeral key pair | CEK wrapped to attested VM only |
+| Metadata secret injection | KRS wraps CEK after AMD VCEK chain verification | Config released only after attestation |
+| Continuous attestation | 5-min PCR polling | Keylime-style monitor, zeroize on failure |
+| Failsafe zeroization | mlock + MADV_DONTDUMP + memoryview | Secrets in non-swappable memory |
 
-## Source Documents
+## Deployment Targets
 
-The `docs/` directory contains the IBM patent and NIST reference materials
-that informed this architecture:
+| Platform | TEE | Nitrokey | Verdict |
+|:---|:---|:---|:---|
+| **GCP N2D (EPYC Milan)** | SEV-SNP | Via KRS (external service) | Production target |
+| **GCP C3D (EPYC Genoa)** | SEV-SNP | Via KRS | Production target |
+| **AWS m6a/c6a** | SEV-SNP | Via KRS (Nitro Enclave) | Production target |
+| **IBM LinuxONE** | SEL (native HPVS) | Crypto Express HSM | Native HPVS |
+| OCI Ampere A1 | **None** | N/A | **Incompatible** |
+| Standard VMs | **None** | N/A | **Incompatible** |
 
-| Document | Content |
-|:---|:---|
-| `HyperProtect-solution-brief.pdf` | IBM HPVS v2.1 architecture, SEL, multi-party contract |
-| `BINDING SECURE KEYS...` (US 11,500,988 B2) | HSM key binding to guest identity via Secure Interface Control |
-| `Confidential data provided to a secure guest via metadata.pdf` | Metadata-based secret injection without cloud visibility |
-| `Confidential Computing across Edge-to-Cloud...` | TEE survey: SGX, SEV, SEV-ES, SEV-SNP, TDX, Arm CCA |
-| `Confidential Computing for OpenPOWER.pdf` | POWER9/POWER10 secure execution architecture |
-| `NIST IR 8320_Hardware-Enabled Security.pdf` | NIST framework: CoT, attestation, key broker pattern |
-| `Provisioning secure encrypted virtual machines...` | VM provisioning with encrypted boot chain |
-| `Secure execution guest owner controls...` | Guest owner policy enforcement on secure interface |
-| `Service processor and system with secure booting...` | Secure boot with SP integrity monitoring |
+GCP requires explicit SEV-SNP:
+```bash
+gcloud compute instances create ... \
+  --confidential-compute-type=SEV_SNP \
+  --min-cpu-platform="AMD Milan"
+```
 
 ## Implementation
 
-`src/cloud_protection.py` — 1,189 lines, 9-class implementation:
+`src/cloud_protection.py` — v3 prototype:
 
 | Class | Role |
 |:---|:---|
-| `ProtectedMemory` | mlock + MADV_DONTDUMP ctypes buffer |
-| `SecureZeroizer` | Signal handler → zeroize → kill process |
-| `ProcessObfuscator` | prctl(PR_SET_NAME) |
-| `TEAttestationVerifier` | SEV/TDX/TPM detection + measurement |
-| `MetadataDecryptor` | AES-256-GCM with HKDF from attestation |
-| `ContinuousAttestationMonitor` | Threaded 5-min PCR polling |
-| `LuksProtection` | LUKS2 with TEE-derived passphrase |
-| `NitrokeyRootOfTrust` | fido2-token -L, fido2-assert, hmac-secret |
-| `CloudProtectionLayer` | 7-step bootstrap orchestrator |
+| `ProtectedMemory` | mlock + MADV_DONTDUMP, memoryview reads (avoids key serialization) |
+| `SecureZeroizer` | Signal handler → zeroize all memory → exit |
+| `TEEAttestation` | SEV-SNP/TDX detection, ioctl SNP_GET_REPORT, measurement verification |
+| `NitrokeyRoT` | FIDO2 hmac-secret via `fido2-assert -G` with credential + salt |
+| `ContinuousAttestationMonitor` | Threaded 5-min PCR polling, zeroize on failure |
+| `CloudProtection` | 8-step bootstrap orchestrator (KRS path + dev local path) |
 
-`src/CLOUD_PROTECTION.md` — Architecture diagram, GCP N2D SEV setup, OCI
-Ampere limitations, Nitrokey enrollment, build-time sealing, attestation
-workflow, disaster recovery.
+## Remaining Hardening
 
-## Free-Tier Deployment Target
+The architecture is sound but the implementation requires these before production:
 
-| Cloud | Instance | TEE | Cost | Status |
-|:---|:---|:---|:---|:---|
-| **GCP N2D** | AMD EPYC Milan (n2d-standard-2) | SEV-ES | ~$50/mo | **Recommended** |
-| OCI Ampere | A1.Flex (4 OCPU, 24GB) | No guest TEE | Free tier | Fallback (no SEV) |
-| AWS | t3.medium | Nitro Enclaves | ~$30/mo | Nitro Enclaves require separate VM |
-| IBM Cloud | LinuxONE Community Cloud | Full SEL | Free tier (60 days) | Native HPVS, time-limited |
+- [ ] Real SNP_GET_REPORT ioctl verified on GCP N2D SEV-SNP
+- [ ] KRS verifies AMD VCEK/VLEK → ASK → ARK certificate chain
+- [ ] KRS verifies nonce freshness, report_data, policy, TCB, and measurement allowlist
+- [ ] KRS uses mTLS or signed HPKE response with pinned identity (currently urllib)
+- [ ] Local attestation path refuses production mode (gated behind `--production` flag)
+- [ ] Plaintext strategy written to tmpfs/LUKS, not persistent VM disk
+- [ ] Tampered ciphertext, replayed quote, wrong measurement, wrong TCB all fail closed
+- [ ] Key unwrap path eventually moved to Rust/Go/C for zero-copy guarantee
 
-## Quick Start
+## Source Documents
+
+See `docs/` — IBM HPVS patents, NIST IR 8320, TEE survey, and OpenPOWER secure execution.
+
+## Quick Start (Development)
 
 ```bash
-# 1. Verify TEE support
-python cloud_protection.py --check-only
-
-# 2. Touch Nitrokey to bootstrap
-python cloud_protection.py --bootstrap --nitrokey
-
-# 3. Decrypt trading bot config
-python cloud_protection.py --unseal
-
-# 4. Start with continuous attestation
-python cloud_protection.py --start \
-  --continuous-attestation \
-  --entrypoint combined_runner.py
+python cloud_protection.py --check-only           # Detect TEE + Nitrokey
+python cloud_protection.py --bootstrap --verbose   # Dev mode (local verify)
+python cloud_protection.py --production --key-service-url https://krs:8443 # Prod
 ```
-
-## Requirements
-
-- Python 3.11+
-- Nitrokey FIDO2 (or compatible FIDO2 YubiKey)
-- AMD EPYC with SEV-ES enabled (GCP N2D or bare metal)
-- `openssl`, `cryptsetup`, `fido2-tools` (system packages)
-- Keylime (for continuous attestation in production)
 
 ## License
 
