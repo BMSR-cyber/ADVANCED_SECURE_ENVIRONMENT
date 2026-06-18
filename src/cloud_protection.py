@@ -444,7 +444,75 @@ def decrypt_package(sealed_dir: Path, master_key: ProtectedMemory, out_dir: Path
     return count
 
 
-# ── 7. Continuous Attestation Monitor ─────────────────────────────────────────
+# ── 7. No-Interactive-Access Enforcement (IBM HPVS equivalent) ────────────────
+
+class EnforceLockdown:
+    """Production mode refuses to start if interactive access is available.
+    
+    IBM HPVS explicitly designs for no interactive deployed-instance access:
+    no SSH daemon, no login shell, no cloud-init, no debug agents, no serial
+    console. An admin shell defeats the entire SEV-SNP design because an
+    attacker with shell + sudo can dump process memory, access /proc/*/mem,
+    and extract decrypted strategy or encryption keys.
+    """
+
+    @staticmethod
+    def check(production: bool) -> None:
+        if not production:
+            logging.info("Lockdown: development mode (interactive access allowed)")
+            return
+
+        issues = []
+
+        # SSH daemon
+        try:
+            rc = subprocess.run(["systemctl", "is-active", "--quiet", "sshd"],
+                              capture_output=True, timeout=5).returncode
+            if rc == 0:
+                issues.append("SSH daemon active")
+        except Exception:
+            if os.path.exists("/usr/sbin/sshd"):
+                issues.append("SSH binary present")
+
+        # Interactive shells
+        for sh in ["/bin/bash", "/bin/sh", "/bin/zsh"]:
+            if os.path.exists(sh):
+                issues.append(f"interactive shell: {sh}")
+                break
+
+        # cloud-init
+        try:
+            ci = subprocess.run(["cloud-init", "status"], capture_output=True, text=True, timeout=5)
+            if ci.returncode == 0 and "disabled" not in ci.stdout:
+                issues.append("cloud-init active")
+        except Exception:
+            if os.path.exists("/etc/cloud/cloud.cfg"):
+                issues.append("cloud-init config present")
+
+        # Debug agents
+        for agent in ["strace", "gdb", "ltrace", "valgrind"]:
+            if os.path.exists(f"/usr/bin/{agent}"):
+                issues.append(f"debug agent: {agent}")
+                break
+
+        # Serial console
+        for tty in ["/dev/ttyS0", "/dev/ttyAMA0"]:
+            if os.path.exists(tty):
+                issues.append(f"serial console: {tty}")
+                break
+
+        if issues:
+            for i in issues:
+                logging.error("Lockdown: %s", i)
+            raise AttestationError(
+                f"Production requires locked-down image. {len(issues)} violations: "
+                f"{'; '.join(issues[:3])}{'...' if len(issues) > 3 else ''}"
+            )
+
+        logging.info("Lockdown: no interactive access — all checks passed")
+
+
+# ── 8. Continuous Attestation Monitor ─────────────────────────────────────────
 
 class ContinuousAttestationMonitor:
     """Polls attestation state every MONITOR_INTERVAL seconds.
@@ -566,6 +634,9 @@ class CloudProtection:
             # Step 0: Lock all memory pages
             _libc().mlockall(MCL_CURRENT | MCL_FUTURE)
             logging.info("mlockall(MCL_CURRENT|MCL_FUTURE) — all pages locked")
+
+            # Step 0.5: Enforce no-interactive-access (production only)
+            EnforceLockdown.check(self._production)
 
             # Step 1: Detect TEE
             logging.info("Step 1/7: Detecting TEE...")

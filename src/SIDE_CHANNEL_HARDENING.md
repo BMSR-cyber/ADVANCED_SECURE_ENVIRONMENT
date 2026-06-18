@@ -1,23 +1,63 @@
-# Side-Channel Hardening: Trade-Output Minimization
+# Side-Channel & IBM HPVS Gap Analysis — Hardening Roadmap
 
-Trade output is the richest side channel in any automated trading system.
-Every order that hits the wire leaks information: timing, sizing,
-direction, frequency. An observer who can see the exchange order stream
-can potentially reverse-engineer the strategy's alpha.
+## Current Status (v3.4)
 
-This document describes the hardening measures implemented in
-`signed_order_intent.py` to eliminate that side channel.
+The ADVANCED_SECURE_ENVIRONMENT project is a **v3 staging candidate** implementing
+the IBM Hyper Protect Virtual Servers architectural pattern on commodity cloud
+hardware (AMD SEV-SNP + external KRS + Nitrokey FIDO2). 
 
----
+**Architecture rating:** 8/10 — directionally correct, matches IBM's confidential
+workload + attestation + separated key-release + protected runtime + signed outputs pattern.
 
-## 1. Why Minimal Order Intents Matter
+**Implementation rating:** 5.5/10 — reference/staging, not hardened.
 
-A typical strategy emits orders carrying substantial metadata:
+## IBM HPVS Gap Summary
 
-```
-{ strategy: "TurtleBreakout_LTC_C+", confidence: 0.87, regime: "trend_high_mom",
-  entry_reason: "20d_high_breakout_vol_confirmed", model_version: "v3.2.1",
-  symbol: "BTCUSDT", side: "buy", size: 1.374926, stop: 59234.12, target: 61456.78 }
+| Gap | Severity | Status |
+|:---|:---|:---|
+| KRS does not yet fully verify AMD VCEK chain/policy/TCB | Critical | Spec in KRS_POLICY.md; needs SEV-SNP VM |
+| No-interactive-access not enforced | Critical | **Done (v3.4)** — `EnforceLockdown` class |
+| Plaintext runtime not proven tmpfs/LUKS-only | High | tmpfs mandatory gate in production mode |
+| HSM-grade key custody absent (Nitrokey is FIDO2, not Crypto Express) | High | Documented in KRS_POLICY.md |
+| Signed image enforcement not complete | High | Spec in DEPLOYMENT_CONTRACT.md |
+| Side-channel controls not formalized | High | This document + signed_order_intent.py |
+| KRS mTLS/HPKE pinned identity incomplete | High | Spec in KRS_POLICY.md §1 |
+| Compliance/audit evidence absent | Medium-high | Attestation record spec in KRS_POLICY.md §7 |
+| Key unwrap still Python | Medium | Planned: Rust/C helper |
+| Logging/audit pipeline immature | Medium | Structured logging with redaction planned |
+
+## 4-Phase IBM-Equivalence Roadmap
+
+### Phase 1 — Must-have before any real secret (in progress)
+1. [x] KRS verifies AMD VCEK/VLEK chain (spec)
+2. [x] KRS verifies nonce, report_data, measurement, policy, TCB (spec)
+3. [ ] KRS uses mTLS/HPKE with pinned identity
+4. [x] Production mode refuses local attestation path
+5. [x] Decrypted strategy only to tmpfs/LUKS
+6. [x] No SSH/no shell production image (`EnforceLockdown`)
+
+### Phase 2 — IBM-like deployment discipline
+1. [ ] Signed image digest enforced by KRS (spec in DEPLOYMENT_CONTRACT.md)
+2. [ ] Deployment contract signed by workload + environment + auditor
+3. [ ] Auditor-readable signed attestation record (spec in KRS_POLICY.md §7)
+4. [ ] SBOM + provenance + vulnerability scan
+5. [ ] Remote encrypted logs with sensitive-field redaction
+
+### Phase 3 — Side-channel and IP leakage hardening
+1. [x] Minimal signed order-intent schema (`signed_order_intent.py`)
+2. [x] Fixed cadence / batched order emission
+3. [x] Coarse sizing bands
+4. [ ] Dedicated/sole-tenant KRS instance
+5. [ ] Disable SMT where available
+6. [ ] Move CEK unwrap/decrypt to Rust/Go/C
+
+### Phase 4 — HSM/compliance uplift
+1. [ ] Replace Nitrokey-only root with HSM-backed KRS (YubiHSM 2 / CloudHSM)
+2. [ ] FIPS-grade crypto boundary
+3. [ ] External security review
+4. [ ] Formal audit evidence pack
+
+## Trade-Output Side Channel (highest practical risk)
 ```
 
 This leaks:
