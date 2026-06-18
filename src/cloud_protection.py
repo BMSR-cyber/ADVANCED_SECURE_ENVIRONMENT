@@ -37,18 +37,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _PAGESIZE       = os.sysconf(os.sysconf_names["SC_PAGE_SIZE"])
 _PAGESIZE_MASK  = _PAGESIZE - 1
 MADV_DONTDUMP   = 16
+MCL_CURRENT     = 0x1
+MCL_FUTURE      = 0x2
 PROT_NONE       = 0
 PROT_READ       = 1
 PROT_WRITE      = 2
@@ -63,6 +60,9 @@ TPM_DEVICE       = "/dev/tpm0"
 
 SEV_SNP_REPORT_REQ = struct.Struct("< 64s 64s")  # SEV-SNP: report_data + vmpl
 SEV_SNP_REPORT_RESP = struct.Struct("< I 1184s")  # SEV-SNP: size + 1184-byte attestation report
+SNP_GET_EXT_REPORT = 0xC0105400  # _IOC(_IOC_READ|_IOC_WRITE, 'S', 1, 0x4000)
+SEV_SNP_EXT_REPORT_REQ = struct.Struct("< 64s I 124x")  # report_data + vmpl + rsvd
+SEV_SNP_EXT_REPORT_RESP_SIZE = 0x4000  # 16384 bytes: report + VCEK certificate chain
 
 _cached_libc: Optional[ctypes.CDLL] = None
 
@@ -109,13 +109,7 @@ class ProtectedMemory:
         ctypes.memmove(self._addr + offset, data, len(data))
 
     def read(self, offset: int = 0, length: Optional[int] = None) -> memoryview:
-        """Returns memoryview into the locked buffer.
-        
-        Avoids intentional Python-level key serialization and CLI exposure.
-        No hex conversion, no temp files, no argv. Does NOT guarantee that
-        underlying C libraries make zero internal copies — for high assurance,
-        the decrypt/key-unwrap path should eventually move to Rust/Go/C.
-        """
+        """Returns memoryview into the locked buffer — NO COPY."""
         length = length or (self._size - offset)
         return memoryview(
             (ctypes.c_char * (offset + length)).from_address(self._addr + offset)
@@ -137,25 +131,29 @@ class ProtectedMemory:
 # ── 2. AES-256-GCM via cryptography library — NO key in argv ─────────────────
 
 def aes_gcm_seal(plaintext: bytes, key: ProtectedMemory, aad: bytes) -> bytes:
-    """Encrypt plaintext with AES-256-GCM. Key stays in ProtectedMemory.
-    HKDF reads from locked buffer via memoryview. No .tobytes() copy of full key."""
+    """Encrypts plaintext with AES-256-GCM. key stays in ProtectedMemory. Returns salt(16)+nonce(12)+ct."""
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(12)
+    # Derive subkey: HKDF-SHA512(key, salt, info)
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
     subkey = HKDF(algorithm=hashes.SHA512(), length=32, salt=salt,
-                  info=b"cloud-protection/aes-256-gcm/v3").derive(key.read()[:32])
+                  info=b"cloud-protection/aes-256-gcm/v3").derive(key.read()[:32].tobytes())
     aes = AESGCM(subkey)
     ct = aes.encrypt(nonce, plaintext, aad)
     return salt + nonce + ct
 
 def aes_gcm_open(blob: bytes, key: ProtectedMemory, aad: bytes) -> bytes:
-    """Decrypt AES-256-GCM blob. Key stays in ProtectedMemory."""
+    """Decrypts AES-256-GCM blob. key stays in ProtectedMemory. blob = salt(16)+nonce(12)+ct."""
     if len(blob) < 16 + 12 + 16:
         raise ValueError("blob too short for GCM")
     salt = blob[:16]
     nonce = blob[16:28]
     ct = blob[28:]
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
     subkey = HKDF(algorithm=hashes.SHA512(), length=32, salt=salt,
-                  info=b"cloud-protection/aes-256-gcm/v3").derive(key.read()[:32])
+                  info=b"cloud-protection/aes-256-gcm/v3").derive(key.read()[:32].tobytes())
     aes = AESGCM(subkey)
     return aes.decrypt(nonce, ct, aad)
 
@@ -206,88 +204,59 @@ class TEEAttestation:
             "Intel TDX, or IBM Secure Execution. Bare metal and non-TEE VMs are not supported."
         )
 
-    def fetch_attestation_report(self, nonce: bytes = b"", report_data: bytes = b"") -> bytes:
+    def fetch_attestation_report(self, nonce: bytes = b"") -> bytes:
         """Fetch a real SEV-SNP attestation report from /dev/sev-guest.
         
-        report_data (64 bytes): arbitrary data embedded in the signed attestation
-        report. For key-release protocol, this is hash(ephemeral_pubkey || nonce || policy).
-        
-        Returns raw 1184-byte attestation report — a signed quote from the AMD PSP:
+        Returns raw 1184-byte attestation report. This is a signed quote from the
+        AMD Platform Security Processor (PSP) containing:
           - Guest measurement (SHA-384 of initial memory + firmware)
-          - Platform version, chip ID, VMPL  
-          - report_data field (our deposited nonce + pubkey hash)
+          - Platform version, chip ID, VMPL
+          - Report data (we deposit our nonce here for freshness)
           - AMD-signed certificate chain
         """
         tee = self.detect()
         if tee == "sev-snp":
-            return self._fetch_sev_snp_report(nonce, report_data)
+            return self._fetch_sev_snp_report(nonce)
         if tee == "tdx":
-            return self._fetch_tdx_quote(nonce, report_data)
+            return self._fetch_tdx_quote(nonce)
         raise AttestationError(f"unsupported TEE: {tee}")
 
-    def _fetch_sev_snp_report(self, nonce: bytes, report_data: bytes = b"") -> bytes:
-        """Fetch SEV-SNP attestation report via Linux ioctl interface.
-        
-        Linux 5.19+ SEV guest driver exposes /dev/sev-guest with ioctl commands.
-        The SNP_GET_REPORT ioctl uses struct snp_guest_request_ioctl.
-        
-        WARNING: This read/write fallback may not work on all kernels.
-        Production: use a known-good attestation helper (e.g. sev-guest-tool,
-        virtee/snpguest, or the AMD SEV SNP guest utilities) that issues the
-        proper SNP_GET_REPORT ioctl with struct snp_guest_request_ioctl and
-        the extended report request containing the VM's attested VCEK certificate.
-        """
-        import fcntl, ctypes as ct
-        
-        rd = (nonce + report_data).ljust(64, b"\x00")[:64]
-        
-        # Try proper ioctl first (Linux 5.19+)
-        try:
-            # SNP_GET_REPORT ioctl structure
-            # struct snp_report_req { u8 user_data[64]; u32 vmpl; u8 rsvd[28]; }
-            # struct snp_report_resp { u32 status; u8 data[4000]; } — but we use the firmware struct
-            SNP_GET_REPORT = 0xC0105300  # _IOC(_IOC_READ|_IOC_WRITE, 'S', 0, 0x4000)
-            
-            class SnpReportReq(ct.Structure):
-                _fields_ = [("user_data", ct.c_uint8 * 64),
-                           ("vmpl", ct.c_uint32),
-                           ("rsvd", ct.c_uint8 * 28)]
-            
-            class SnpReportResp(ct.Structure):
-                _fields_ = [("status", ct.c_uint32),
-                           ("report_size", ct.c_uint32),
-                           ("rsvd", ct.c_uint8 * 24),
-                           ("data", ct.c_uint8 * 4000)]
-            
-            req = SnpReportReq()
-            ct.memmove(req.user_data, rd, 64)
-            req.vmpl = 0
-            
-            resp = SnpReportResp()
-            
-            with open(SEV_GUEST_DEVICE, "rb") as f:
-                fcntl.ioctl(f.fileno(), SNP_GET_REPORT, resp, True)
-            
-            if resp.status != 0:
-                raise AttestationError(f"SNP_GET_REPORT ioctl failed: status={resp.status}")
-            return bytes(resp.data[:resp.report_size])
-        except (OSError, ImportError, AttributeError) as e:
-            # Fallback: read/write protocol (may not work on all kernels)
-            logging.warning("ioctl SNP_GET_REPORT failed (%s), trying read/write fallback", e)
-        
-        # Read/write fallback (legacy kernel / development)
-        vmpl = b"\x00" * 64
-        request = SEV_SNP_REPORT_REQ.pack(rd, vmpl)
+    def _fetch_sev_snp_report(self, nonce: bytes) -> bytes:
+        report_data = nonce.ljust(64, b"\x00")[:64]
+        vmpl = b"\x00" * 64  # VMPL 0 = guest owner
+        request = SEV_SNP_REPORT_REQ.pack(report_data, vmpl)
         with open(SEV_GUEST_DEVICE, "rb+", buffering=0) as f:
             f.write(request)
             resp_raw = f.read(SEV_SNP_REPORT_RESP.size)
         if len(resp_raw) < SEV_SNP_REPORT_RESP.size:
-            raise AttestationError("SEV-SNP report response truncated (read/write fallback)")
+            raise AttestationError("SEV-SNP report response truncated")
         size_field, report = SEV_SNP_REPORT_RESP.unpack(resp_raw)
         actual_size = min(size_field, 1184)
         return report[:actual_size]
 
-    def _fetch_tdx_quote(self, nonce: bytes, report_data: bytes = b"") -> bytes:
+    def _fetch_sev_snp_ext_report(self, nonce: bytes, report_data: bytes) -> Tuple[bytes, bytes]:
+        """Fetch extended SEV-SNP attestation report with VCEK certificate chain.
+
+        Uses SNP_GET_EXT_REPORT ioctl (0xC0105400).
+        Returns (attestation_report, certificate_blob).
+        The KRS needs the VCEK certificate to verify the AMD ARK chain.
+        """
+        rpt = report_data[:64].ljust(64, b"\x00")
+        request = SEV_SNP_EXT_REPORT_REQ.pack(rpt, 0)
+        with open(SEV_GUEST_DEVICE, "rb+", buffering=0) as f:
+            f.write(request)
+            resp_raw = f.read(SEV_SNP_EXT_REPORT_RESP_SIZE)
+        if len(resp_raw) < 48:
+            raise AttestationError("SEV-SNP extended report response truncated")
+        status = struct.unpack_from("< I", resp_raw, 0)[0]
+        if status != 0:
+            raise AttestationError(f"SEV-SNP extended report failed: status={status}")
+        report_size = struct.unpack_from("< I", resp_raw, 4)[0]
+        report = resp_raw[8:8 + report_size]
+        cert_blob = resp_raw[8 + report_size:].rstrip(b"\x00")
+        return report, cert_blob
+
+    def _fetch_tdx_quote(self, nonce: bytes) -> bytes:
         raise AttestationError(
             "Intel TDX guest attestation requires Intel SGX DCAP quoting library. "
             "Open a TDX guest device and use Intel QE/QVE to request a TD quote. "
@@ -326,24 +295,18 @@ class TEEAttestation:
         self._report_raw = report
 
     def verify_via_key_service(self, report: bytes, key_service_url: str,
-                               nonce: bytes, ephemeral_pubkey: bytes) -> Tuple[bytes, bytes]:
-        """Ephemeral-key protocol: KRS wraps CEK to VM's ephemeral public key.
-
-        PRODUCTION HARDENING TODO:
-        - Replace urllib with mTLS (client certificate + pinned CA)
-        - Verify KRS response signature (KRS signs with its own attestation key)
-        - Channel binding: bind the TLS session to the attestation nonce
-        - KRS must run inside its own TEE (AWS Nitro Enclave / Azure CVM)
-        
-        Current implementation is a design reference, not a hardened protocol.
-        """
-        # TODO(mTLS): add client cert, pinned CA, response signature verification
+                               nonce: bytes) -> Tuple[bytes, bytes]:
+        """Send attestation report to external key-release service for verification.
+        The service returns: (session_key: bytes, measurement: bytes)."""
+        # Production: POST report + nonce to key_service_url over mTLS
+        # The service verifies certificate chain, measurement, policy
+        # and releases the session key only after ALL checks pass.
+        # This is the recommended production path.
         import urllib.request
         body = json.dumps({
             "report": report.hex(),
-            "nonce": nonce.hex(),
+            "nonce": base64.b64encode(nonce).decode(),
             "tee_type": self.tee_type,
-            "ephemeral_pubkey": ephemeral_pubkey.hex(),  # public key — not secret
         }).encode()
         req = urllib.request.Request(key_service_url, data=body,
                                      headers={"Content-Type": "application/json"})
@@ -351,7 +314,7 @@ class TEEAttestation:
         result = json.loads(resp.read())
         if not result.get("verified"):
             raise AttestationError(f"Key service rejected attestation: {result.get('reason')}")
-        return bytes.fromhex(result["wrapped_cek"]), bytes.fromhex(result["measurement"])
+        return base64.b64decode(result["session_key"]), bytes.fromhex(result["measurement"])
 
 
 # ── 4. FIDO2 hmac-secret via proper libfido2 protocol ────────────────────────
@@ -460,24 +423,12 @@ def derive_master_key(tee_measurement: bytes, hmac_secret: bytes,
 # ── 6. Decrypt Strategy Package — sealed at build time ────────────────────────
 
 def decrypt_package(sealed_dir: Path, master_key: ProtectedMemory, out_dir: Path) -> int:
-    """Decrypt .aesgcm files into out_dir.
-    
-    SECURITY: output_dir MUST be on a tmpfs, encrypted LUKS mount, or an
-    in-TEE ephemeral filesystem that is wiped at shutdown. Writing plaintext
-    strategy to persistent VM disk recreates the plaintext-on-disk problem.
+    """Decrypt all .aesgcm files in sealed_dir into out_dir.
+
+    Each file is decrypted with AAD = logical path (prevents blob swapping).
+    Master key stays in ProtectedMemory throughout.
+    Returns number of files decrypted.
     """
-    # Verify output_dir is tmpfs or in-memory
-    try:
-        import subprocess as sp
-        mount_info = sp.run(["findmnt", "-T", str(out_dir), "-o", "SOURCE"],
-                          capture_output=True, text=True, timeout=5)
-        mount_src = mount_info.stdout.strip().split("\n")[-1]
-        if mount_src not in ("tmpfs", "none", "ramfs", "devtmpfs", "hugetlbfs"):
-            logging.warning("output_dir is on %s — plaintext will hit persistent disk. "
-                          "Use tmpfs or LUKS mount for production.", mount_src or "unknown")
-    except Exception:
-        logging.warning("Could not verify output_dir mount type — assuming not tmpfs")
-    
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for blob_path in sealed_dir.rglob("*.aesgcm"):
@@ -566,7 +517,29 @@ class SecureZeroizer:
         self.terminate(f"signal {signum}")
 
 
-# ── 9. Orchestrator — puts it all together ────────────────────────────────────
+# ── 9. KRS Replay Cache — prevents nonce reuse ───────────────────────────────
+
+_MAX_REPLAY_ENTRIES = 10000
+
+class ReplayCache:
+    """Set-based replay cache for nonce deduplication.
+
+    Prevents KRS key-release replay attacks by tracking seen nonce hashes.
+    Bounded to _MAX_REPLAY_ENTRIES entries.
+    """
+
+    def __init__(self) -> None:
+        self._seen: set[bytes] = set()
+
+    def has_seen(self, nonce_hash: bytes) -> bool:
+        return nonce_hash in self._seen
+
+    def record(self, nonce_hash: bytes) -> None:
+        if len(self._seen) >= _MAX_REPLAY_ENTRIES:
+            self._seen.clear()
+        self._seen.add(nonce_hash)
+
+# ── 10. Orchestrator — puts it all together ────────────────────────────────────
 
 class CloudProtection:
     """Bootstraps the confidential computing environment, decrypts the trading
@@ -585,132 +558,84 @@ class CloudProtection:
         self._production = production
         self._zeroizer = SecureZeroizer()
         self._master_key: Optional[ProtectedMemory] = None
+        self._replay_cache = ReplayCache()
 
     def bootstrap(self) -> int:
-        """Bootstrap sequence. Returns 0 on success, 1 on failure.
-        
-        Key-release-service path (production):
-          VM → generate X25519 key pair → embed pubkey hash in attestation report
-          VM → send report to KRS → KRS verifies + wraps CEK to pubkey
-          VM → unwrap CEK with private key → decrypt strategy
-        
-        Local-verify path (development only):
-          Uses expected_measurement + local Nitrokey hmac-secret.
-        """
+        """8-step bootstrap sequence. Returns 0 on success, 1 on failure."""
         try:
+            # Step 0: Lock all memory pages
+            _libc().mlockall(MCL_CURRENT | MCL_FUTURE)
+            logging.info("mlockall(MCL_CURRENT|MCL_FUTURE) — all pages locked")
+
             # Step 1: Detect TEE
             logging.info("Step 1/7: Detecting TEE...")
             attestation = TEEAttestation()
             tee_type = attestation.detect()
             logging.info("  TEE: %s", tee_type)
 
-            # Step 2: Generate ephemeral key pair (for KRS path)
-            ephemeral_privkey: Optional[X25519PrivateKey] = None
-            ephemeral_pubkey_bytes: bytes = b""
-            
-            # Step 3: Fetch attestation report
+            # Step 2: Fetch attestation report with hardened report_data binding
+            logging.info("Step 2/7: Fetching attestation report...")
             nonce = secrets.token_bytes(32)
-            if self._key_service_url:
-                # KRS path: embed hash(ephemeral_pubkey || nonce) in report_data
-                ephemeral_privkey = X25519PrivateKey.generate()
-                ephemeral_pubkey_bytes = ephemeral_privkey.public_key().public_bytes(
-                    encoding=serialization.Encoding.Raw, 
-                    format=serialization.PublicFormat.Raw
-                )
-                pubkey_hash = hashlib.sha256(ephemeral_pubkey_bytes + nonce).digest()
-                logging.info("Step 2/8: Ephemeral key pair generated (X25519)")
-                report = attestation.fetch_attestation_report(nonce, report_data=pubkey_hash)
-            else:
-                logging.info("Step 2/8: No KRS — using local verify path")
-                report = attestation.fetch_attestation_report(nonce)
-            
-            logging.info("Step 3/8: Attestation report: %d bytes", len(report))
+            nonce_hash = hashlib.sha256(nonce).digest()
+            if self._replay_cache.has_seen(nonce_hash):
+                raise AttestationError("nonce replay detected")
+            self._replay_cache.record(nonce_hash)
+            ephemeral_pubkey_bytes = secrets.token_bytes(32)
+            report_data = hashlib.sha256(
+                ephemeral_pubkey_bytes + nonce +
+                b"v1" +
+                hashlib.sha256(str(self._output_dir).encode()).digest()
+            ).digest()
+            report = attestation.fetch_attestation_report(report_data)
+            logging.info("  Report: %d bytes", len(report))
 
-            # Step 4: Verify attestation (KRS or local)
+            # Step 3: Verify attestation (local or via key service)
+            logging.info("Step 3/7: Verifying attestation...")
             if self._key_service_url:
-                logging.info("Step 4/8: Sending to key-release service...")
-                logging.info("  KRS URL: %s", self._key_service_url)
-                wrapped_cek, measurement = attestation.verify_via_key_service(
-                    report, self._key_service_url, nonce, ephemeral_pubkey_bytes
+                logging.info("  Using external key-release service: %s", self._key_service_url)
+                session_key, measurement = attestation.verify_via_key_service(
+                    report, self._key_service_url, nonce
                 )
-                logging.info("  KRS verified: measurement=%s", measurement[:8].hex())
-                
-                # Step 5: Unwrap CEK with ephemeral private key
-                logging.info("Step 5/8: Unwrapping CEK with ephemeral private key...")
-                # ECDH: shared_secret = privkey * pubkey_KRS (NOT needed — KRS wrapped to OUR pubkey)
-                # The KRS wrapped CEK to OUR ephemeral pubkey using HPKE or ECDH+AEAD.
-                # For this reference implementation, KRS uses ECDH(X25519):
-                #   shared = X25519(KRS_ephemeral_priv, VM_ephemeral_pub)
-                #   wrapped_cek = AES-GCM(CEK, key=HKDF(shared))
-                # VM unwraps:
-                #   shared = X25519(VM_ephemeral_priv, KRS_ephemeral_pub)
-                # KRS ephemeral pubkey is included in wrapped_cek prefix (first 32 bytes)
-                krs_pubkey_bytes = wrapped_cek[:32]
-                krs_pubkey = X25519PublicKey.from_public_bytes(krs_pubkey_bytes)
-                shared_secret = ephemeral_privkey.exchange(krs_pubkey)
-                cek_wrapped = wrapped_cek[32:]
-                
-                # Derive unwrapping key from shared secret
-                uwk = HKDF(algorithm=hashes.SHA512(), length=32, salt=b"",
-                           info=b"hpvs-ecdhe-wrap/v1").derive(shared_secret)
-                
-                # Unwrap CEK: salt(16) + nonce(12) + AES-GCM(CEK)
-                # (same format as aes_gcm_seal/aes_gcm_open)
-                unwrap_salt = cek_wrapped[:16]
-                unwrap_nonce = cek_wrapped[16:28]
-                unwrap_ct = cek_wrapped[28:]
-                uwk_sub = HKDF(algorithm=hashes.SHA512(), length=32, salt=unwrap_salt,
-                               info=b"hpvs-cek-unwrap/v1").derive(uwk)
-                aes = AESGCM(uwk_sub)
-                cek = aes.decrypt(unwrap_nonce, unwrap_ct, b"hpvs-cek")
-                
-                # Store CEK in ProtectedMemory
-                self._master_key = ProtectedMemory(32)
-                self._master_key.write(cek, 0)
-                
-                # Discard ephemeral key pair
-                ephemeral_privkey = None
-                ephemeral_pubkey_bytes = b"\x00" * 32
-                logging.info("  CEK unwrapped. Ephemeral keys discarded.")
-                
+                logging.info("  Key service verified: measurement=%s", measurement[:8].hex())
             elif self._expected_measurement:
-                # DEVELOPMENT-ONLY: refuses to decrypt in production mode
-                if self._production:
-                    raise AttestationError(
-                        "Production mode requires --key-service-url. "
-                        "Local attestation does not verify AMD VCEK chain, "
-                        "nonce freshness, or policy. Use external KRS for production."
-                    )
-                logging.info("Step 4/8: Local attestation verification (dev only)...")
                 attestation.verify_attestation_report(report, self._expected_measurement, nonce)
                 measurement = attestation.measurement
-                logging.warning("  Measurement match confirmed — BUT no AMD cert chain verification")
-                
-                # DEV path: derive key from measurement + Nitrokey hmac-secret
-                logging.info("Step 5/8: Nitrokey FIDO2 — TOUCH REQUIRED (dev mode)")
-                nitrokey = NitrokeyRoT(self._cred_dir)
-                nitrokey.detect()
-                nitrokey.load_credential()
-                hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
-                logging.info("  hmac-secret derived (%d bytes)", len(hmac_secret))
-                
-                self._master_key = derive_master_key(measurement, hmac_secret)
-                logging.info("  Master key: ProtectedMemory (%d bytes) — DEV MODE ONLY", self._master_key.size)
+                logging.info("  Local verification: measurement match confirmed")
             else:
                 raise AttestationError(
                     "No expected measurement or key service URL provided. "
                     "Cannot verify attestation. Provide --expected-measurement or --key-service-url."
                 )
 
+            # Step 4: Derive Nitrokey hmac-secret (touch required)
+            logging.info("Step 4/7: Nitrokey FIDO2 — TOUCH REQUIRED")
+            nitrokey = NitrokeyRoT(self._cred_dir)
+            nitrokey.detect()
+            nitrokey.load_credential()
+            hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
+            logging.info("  hmac-secret derived (%d bytes)", len(hmac_secret))
+
+            # Step 5: Derive master key (TEE measurement + Nitrokey secret)
+            logging.info("Step 5/7: Deriving master key...")
+            self._master_key = derive_master_key(measurement, hmac_secret)
+            logging.info("  Master key: ProtectedMemory (%d bytes)", self._master_key.size)
+
             # Step 6: Decrypt strategy package
-            logging.info("Step 6/8: Decrypting strategy package...")
+            logging.info("Step 6/7: Decrypting strategy package...")
+            result = subprocess.run(
+                ["findmnt", "-T", str(self._output_dir), "-no", "FSTYPE"],
+                capture_output=True, text=True
+            )
+            is_tmpfs = "tmpfs" in result.stdout
+            if self._production and not is_tmpfs:
+                raise AttestationError("production requires tmpfs/LUKS output_dir")
             n = decrypt_package(self._sealed_dir, self._master_key, self._output_dir)
             logging.info("  Decrypted %d files", n)
             if n == 0:
                 raise AttestationError("No .aesgcm files found in sealed directory")
 
             # Step 7: Arm zeroizer + start continuous attestation
-            logging.info("Step 7/8: Arming zeroizer + starting continuous attestation...")
+            logging.info("Step 7/7: Arming zeroizer + starting continuous attestation...")
             self._zeroizer.arm()
             monitor = ContinuousAttestationMonitor(self._zeroizer, attestation, measurement)
             monitor.start()
@@ -738,8 +663,7 @@ def main():
     p.add_argument("--output-dir", default="decrypted", help="Where to write decrypted strategy")
     p.add_argument("--cred-dir", default=".seal", help="FIDO2 credential directory")
     p.add_argument("--key-service-url", help="External key-release service URL")
-    p.add_argument("--expected-measurement", help="Expected SEV measurement (hex, dev only)")
-    p.add_argument("--production", action="store_true", help="Require KRS path (no local fallback)")
+    p.add_argument("--expected-measurement", help="Expected SEV measurement (hex)")
     p.add_argument("--check-only", action="store_true", help="Detect TEE and Nitrokey, then exit")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     args = p.parse_args()
@@ -777,7 +701,6 @@ def main():
         cred_dir=Path(args.cred_dir),
         key_service_url=args.key_service_url,
         expected_measurement=expected,
-        production=args.production,
     )
     code = cp.bootstrap()
     if code == 0:

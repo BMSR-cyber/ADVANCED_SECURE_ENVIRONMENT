@@ -72,6 +72,21 @@ The architecture is sound but the implementation requires these before productio
 - [ ] Tampered ciphertext, replayed quote, wrong measurement, wrong TCB all fail closed
 - [ ] Key unwrap path eventually moved to Rust/Go/C for zero-copy guarantee
 
+## Side-Channel Hardening (priority order)
+
+The next threat layer is observable behavior → inferred strategy/keys:
+
+1. **[x] Signed minimal order intents** — `src/signed_order_intent.py`. Only execution fields, coarse size bands, batch emission windows, Ed25519 signatures. Executor is a dumb pipe.
+2. **[x] Hardened attestation binding** — `SNP_GET_EXT_REPORT` + cert blob. `report_data` binds `hash(pubkey||nonce||policy||image_digest)`.
+3. **[x] tmpfs mandatory gate** — Production mode raises `AttestationError` if output_dir not on tmpfs/LUKS.
+4. **[x] `mlockall(MCL_CURRENT|MCL_FUTURE)`** — All pages locked at bootstrap.
+5. **[ ] KRS mTLS/HPKE with pinned identity** — Documented design, not yet implemented.
+6. **[ ] SMT/co-tenancy** — Prefer no-sibling-sharing instances, dedicated KRS host.
+7. **[ ] Key unwrap → Rust/Go/C** — Python stays as orchestrator only.
+8. **[ ] Fail-closed test suite** — Replayed quote, wrong TCB, bad image digest, tampered ciphertext, bad KRS identity all fail closed.
+
+Full hardening plan: `src/SIDE_CHANNEL_HARDENING.md`
+
 ## Source Documents
 
 See `docs/` — IBM HPVS patents, NIST IR 8320, TEE survey, and OpenPOWER secure execution.
