@@ -2,7 +2,10 @@
 
 > **BMSR-cyber** — Confidential computing reference architecture for autonomous trading.
 >
-> **Status:** v3 staging candidate. Not production-hardened. See [Remaining Hardening](#remaining-hardening).
+> **Status:** v3.5 — trust-critical path implemented (real ioctl, snpguest
+> chain/policy/TCB verification, mTLS+pinned KRS, `--production` gating, Rust
+> unwrap). **Pending validation on real SEV-SNP hardware** before production use.
+> See [Remaining Hardening](#remaining-hardening).
 
 Replicates IBM Hyper Protect Virtual Servers (HPVS v2.1) security guarantees on
 accessible cloud hardware using AMD SEV-SNP + external key-release service +
@@ -32,12 +35,19 @@ SIGNED CONTAINER IMAGE → SEV-SNP CONFIDENTIAL VM → ATTESTATION REPORT
 
 | Platform | TEE | Nitrokey | Verdict |
 |:---|:---|:---|:---|
-| **GCP N2D (EPYC Milan)** | SEV-SNP | Via KRS (external service) | Production target |
-| **GCP C3D (EPYC Genoa)** | SEV-SNP | Via KRS | Production target |
-| **AWS m6a/c6a** | SEV-SNP | Via KRS (Nitro Enclave) | Production target |
-| **IBM LinuxONE** | SEL (native HPVS) | Crypto Express HSM | Native HPVS |
-| OCI Ampere A1 | **None** | N/A | **Incompatible** |
-| Standard VMs | **None** | N/A | **Incompatible** |
+| Platform | TEE / attestation | Works with this code? |
+|:---|:---|:---|
+| **GCP N2D (Milan) / C3D (Genoa)** | SEV-SNP guest report | ✅ **Primary target** |
+| **Azure DCas v5 / ECas v5** | SEV-SNP guest report | ✅ Yes (minor wiring) |
+| **Bare-metal AMD EPYC 7003+** | SEV-SNP guest report | ✅ Yes |
+| **AWS m6a/c6a** | **Nitro NSM** (AWS-signed, COSE/CBOR) | ⚠️ **Not as-is** — needs a Nitro adapter |
+| IBM LinuxONE | SEL / HPVS native | ✅ (expensive mainframe) |
+| OCI Ampere / standard VMs | none | ❌ Incompatible |
+
+> **AWS Nitro Enclaves ≠ AMD SEV-SNP.** This repo verifies an AMD SEV-SNP *guest
+> report* (`/dev/sev-guest` → `snpguest` → VCEK→ASK→ARK), which is native on GCP
+> N2D and Azure DCas v5. AWS uses Nitro NSM attestation (a different, AWS-signed
+> document) that this repo does not yet verify — so AWS needs a separate adapter.
 
 GCP requires explicit SEV-SNP:
 ```bash
@@ -45,6 +55,11 @@ gcloud compute instances create ... \
   --confidential-compute-type=SEV_SNP \
   --min-cpu-platform="AMD Milan"
 ```
+
+**Cost & platform selection:** cheapest platform that matches this code is
+**GCP `n2d-standard-2`** (~$45–52/mo on-demand, ballpark — verify on the GCP
+calculator). Spot/preemptible is testing-only (interruption destroys the enclave →
+forced re-attestation + Nitrokey touch). Full breakdown: [`docs/DEPLOYMENT_COST.md`](docs/DEPLOYMENT_COST.md).
 
 ## Implementation
 
@@ -61,16 +76,31 @@ gcloud compute instances create ... \
 
 ## Remaining Hardening
 
-The architecture is sound but the implementation requires these before production:
+Implemented in this pass (see also `docs/ASE_REVIEW.md` for the review that drove it):
 
-- [ ] Real SNP_GET_REPORT ioctl verified on GCP N2D SEV-SNP
-- [ ] KRS verifies AMD VCEK/VLEK → ASK → ARK certificate chain
-- [ ] KRS verifies nonce freshness, report_data, policy, TCB, and measurement allowlist
-- [ ] KRS uses mTLS or signed HPKE response with pinned identity (currently urllib)
-- [ ] Local attestation path refuses production mode (gated behind `--production` flag)
-- [ ] Plaintext strategy written to tmpfs/LUKS, not persistent VM disk
-- [ ] Tampered ciphertext, replayed quote, wrong measurement, wrong TCB all fail closed
-- [ ] Key unwrap path eventually moved to Rust/Go/C for zero-copy guarantee
+- [x] **Real `SNP_GET_REPORT` ioctl** — `snp_verify.fetch_report_ioctl()` uses the
+  kernel uapi (`_IOWR('S',0,32)` on `/dev/sev-guest`). *Run-verify on N2D pending.*
+- [x] **AMD VCEK → ASK → ARK chain verification** — delegated to `snpguest`
+  (virtee) in `snp_verify.SnpVerifier.verify_signature_chain()`, NOT hand-rolled.
+- [x] **report_data, policy (no-debug), TCB floor, measurement allowlist** verified
+  in `SnpVerifier.verify()`. Also fixed a real bug: MEASUREMENT offset is **0x090**,
+  not 0x0A0 (the old value never matched a real report).
+- [x] **KRS mTLS + pinning** — `krs_client.KrsClient`: TLS 1.3 floor, client cert,
+  pinned CA + pinned server-cert fingerprint, and a pinned Ed25519 signature over
+  the KRS response (defeats TLS-terminating substitution). Replaces urllib.
+- [x] **Local attestation path refuses production** — `--production` requires KRS;
+  enforces lockdown, tmpfs, snpguest verification, and the Rust unwrap. Verified:
+  prod-without-pins exits 2; dev/no-TEE fails closed (exit 1).
+- [x] **Key unwrap moved to Rust** — `key_unwrap/` cdylib (HKDF-SHA512 + AES-256-GCM,
+  key/subkey in `Zeroizing`); `rust_unwrap.py` ctypes binding; required in prod.
+  Interop with the Python seal format tested (AAD + tamper rejected).
+
+Still pending (need real hardware / ops):
+- [ ] End-to-end run-verify on GCP N2D SEV-SNP (ioctl + snpguest against a live PSP)
+- [ ] Reference **KRS server** implementing `KRS_POLICY.md` (client side done)
+- [ ] RFC 9266 tls-exporter channel binding (needs Python 3.13+; cert-fpr binding used now)
+- [ ] Plaintext strategy on tmpfs/LUKS confirmed on the deployed image
+- [ ] Fail-closed suite on hardware: replayed quote, wrong TCB, bad image digest, bad KRS identity
 
 ## Side-Channel Hardening (priority order)
 

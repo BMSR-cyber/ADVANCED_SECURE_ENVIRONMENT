@@ -39,6 +39,11 @@ from typing import Callable, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# Hardened sub-modules (see docs/ASE_REVIEW.md). Flat imports: run from src/.
+import snp_verify          # real ioctl fetch + snpguest cert-chain/policy/TCB
+import krs_client          # mTLS + pinned KRS client
+import rust_unwrap         # Rust AES-GCM unwrap (no GC-managed key copies)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _PAGESIZE       = os.sysconf(os.sysconf_names["SC_PAGE_SIZE"])
@@ -222,17 +227,9 @@ class TEEAttestation:
         raise AttestationError(f"unsupported TEE: {tee}")
 
     def _fetch_sev_snp_report(self, nonce: bytes) -> bytes:
-        report_data = nonce.ljust(64, b"\x00")[:64]
-        vmpl = b"\x00" * 64  # VMPL 0 = guest owner
-        request = SEV_SNP_REPORT_REQ.pack(report_data, vmpl)
-        with open(SEV_GUEST_DEVICE, "rb+", buffering=0) as f:
-            f.write(request)
-            resp_raw = f.read(SEV_SNP_REPORT_RESP.size)
-        if len(resp_raw) < SEV_SNP_REPORT_RESP.size:
-            raise AttestationError("SEV-SNP report response truncated")
-        size_field, report = SEV_SNP_REPORT_RESP.unpack(resp_raw)
-        actual_size = min(size_field, 1184)
-        return report[:actual_size]
+        # Real kernel ABI: ioctl(SNP_GET_REPORT) on /dev/sev-guest. (The old
+        # f.write/f.read on the device was NOT the ABI and never worked on N2D.)
+        return snp_verify.fetch_report_ioctl(nonce, vmpl=0)
 
     def _fetch_sev_snp_ext_report(self, nonce: bytes, report_data: bytes) -> Tuple[bytes, bytes]:
         """Fetch extended SEV-SNP attestation report with VCEK certificate chain.
@@ -272,12 +269,9 @@ class TEEAttestation:
         """
         if len(report) < 48:
             raise AttestationError("report too short")
-        # Parse SEV-SNP report header (offset 0x0A0 for measurement in SNP report)
-        # SEV-SNP attestation report layout (AMD SEV-SNP ABI spec):
-        #   offset 0x0A0: measurement (48 bytes, SHA-384)
-        #   offset 0x0E0: host_data (32 bytes)
-        #   offset 0x0A0+48: policy, family_id, image_id, etc.
-        measured = report[0x0A0:0x0A0+48]
+        # SEV-SNP attestation report layout (AMD ABI): MEASUREMENT is at 0x090,
+        # not 0x0A0 (the original was off by 0x10 and never matched a real report).
+        measured = snp_verify.parse_measurement(report)
         if measured != expected_measurement.ljust(48, b"\x00")[:48]:
             raise AttestationError(
                 f"Measurement mismatch. Expected: {expected_measurement[:8].hex()}... "
@@ -294,27 +288,19 @@ class TEEAttestation:
         self._measurement = measured[:48]
         self._report_raw = report
 
-    def verify_via_key_service(self, report: bytes, key_service_url: str,
-                               nonce: bytes) -> Tuple[bytes, bytes]:
-        """Send attestation report to external key-release service for verification.
-        The service returns: (session_key: bytes, measurement: bytes)."""
-        # Production: POST report + nonce to key_service_url over mTLS
-        # The service verifies certificate chain, measurement, policy
-        # and releases the session key only after ALL checks pass.
-        # This is the recommended production path.
-        import urllib.request
-        body = json.dumps({
-            "report": report.hex(),
-            "nonce": base64.b64encode(nonce).decode(),
-            "tee_type": self.tee_type,
-        }).encode()
-        req = urllib.request.Request(key_service_url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        result = json.loads(resp.read())
-        if not result.get("verified"):
-            raise AttestationError(f"Key service rejected attestation: {result.get('reason')}")
-        return base64.b64decode(result["session_key"]), bytes.fromhex(result["measurement"])
+    def verify_via_key_service(self, report: bytes, krs: "krs_client.KrsClient",
+                               eph_priv) -> Tuple[bytes, bytes]:
+        """Release the CEK via the mTLS+pinned KRS client.
+
+        The KRS independently verifies the AMD cert chain, measurement, policy
+        and gates on a Nitrokey touch; it ECDH-wraps the CEK to `eph_priv`'s
+        attested public half and signs the response with its pinned Ed25519 key
+        (both checked inside krs.release)."""
+        cek, measurement = krs.release(report, eph_priv, self.tee_type)
+        self._tee_type = self.tee_type
+        self._measurement = measurement
+        self._report_raw = report
+        return cek, measurement
 
 
 # ── 4. FIDO2 hmac-secret via proper libfido2 protocol ────────────────────────
@@ -422,14 +408,23 @@ def derive_master_key(tee_measurement: bytes, hmac_secret: bytes,
 
 # ── 6. Decrypt Strategy Package — sealed at build time ────────────────────────
 
-def decrypt_package(sealed_dir: Path, master_key: ProtectedMemory, out_dir: Path) -> int:
+def decrypt_package(sealed_dir: Path, master_key: ProtectedMemory, out_dir: Path,
+                    require_rust: bool = False) -> int:
     """Decrypt all .aesgcm files in sealed_dir into out_dir.
 
     Each file is decrypted with AAD = logical path (prevents blob swapping).
-    Master key stays in ProtectedMemory throughout.
-    Returns number of files decrypted.
+    Prefers the Rust unwrap (master key + derived subkey handled in Rust with
+    zeroization, no GC-managed Python key copies). In production require_rust
+    forces it — falling back to the Python path (which copies the key into a
+    Python bytes) is refused. Returns number of files decrypted.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    use_rust = rust_unwrap.available()
+    if require_rust and not use_rust:
+        raise AttestationError(
+            "production requires the Rust key_unwrap cdylib (no GC-managed key "
+            "copies). Build it: cd key_unwrap && cargo build --release")
+    logging.info("decrypt path: %s", "rust" if use_rust else "python (dev)")
     count = 0
     for blob_path in sealed_dir.rglob("*.aesgcm"):
         rel = blob_path.relative_to(sealed_dir).with_suffix("")
@@ -437,7 +432,10 @@ def decrypt_package(sealed_dir: Path, master_key: ProtectedMemory, out_dir: Path
         target.parent.mkdir(parents=True, exist_ok=True)
         blob = blob_path.read_bytes()
         aad = str(rel).encode()
-        pt = aes_gcm_open(blob, master_key, aad)
+        if use_rust:
+            pt = rust_unwrap.hkdf_aesgcm_open(bytes(master_key.read()[:32]), blob, aad)
+        else:
+            pt = aes_gcm_open(blob, master_key, aad)
         target.write_bytes(pt)
         count += 1
         logging.info("decrypted: %s → %s (%d bytes)", rel, target, len(pt))
@@ -543,8 +541,8 @@ class ContinuousAttestationMonitor:
             time.sleep(MONITOR_INTERVAL)
             try:
                 report = self._attestation.fetch_attestation_report()
-                # Quick measurement re-check
-                measured = report[0x0A0:0x0A0+48]
+                # Quick measurement re-check (correct ABI offset 0x090)
+                measured = snp_verify.parse_measurement(report)
                 if measured != self._expected.ljust(48, b"\x00")[:48]:
                     logging.critical("ATTESTATION FAILED: measurement changed")
                     self._zeroizer.terminate("measurement changed")
@@ -617,101 +615,111 @@ class CloudProtection:
                  cred_dir: Path = Path(".seal"),
                  key_service_url: Optional[str] = None,
                  expected_measurement: Optional[bytes] = None,
-                 production: bool = False):
+                 production: bool = False,
+                 krs_config: Optional[dict] = None,
+                 min_tcb: int = 0):
         self._sealed_dir = sealed_dir
         self._output_dir = output_dir
         self._cred_dir = cred_dir
         self._key_service_url = key_service_url
         self._expected_measurement = expected_measurement
         self._production = production
+        self._krs_config = krs_config
+        self._min_tcb = min_tcb
         self._zeroizer = SecureZeroizer()
         self._master_key: Optional[ProtectedMemory] = None
         self._replay_cache = ReplayCache()
 
     def bootstrap(self) -> int:
-        """8-step bootstrap sequence. Returns 0 on success, 1 on failure."""
+        """Bootstrap sequence. Returns 0 on success, 1 on failure. Fail-closed."""
         try:
-            # Step 0: Lock all memory pages
             _libc().mlockall(MCL_CURRENT | MCL_FUTURE)
             logging.info("mlockall(MCL_CURRENT|MCL_FUTURE) — all pages locked")
-
-            # Step 0.5: Enforce no-interactive-access (production only)
             EnforceLockdown.check(self._production)
 
-            # Step 1: Detect TEE
-            logging.info("Step 1/7: Detecting TEE...")
+            # 1. Detect TEE
             attestation = TEEAttestation()
             tee_type = attestation.detect()
-            logging.info("  TEE: %s", tee_type)
+            logging.info("TEE: %s", tee_type)
 
-            # Step 2: Fetch attestation report with hardened report_data binding
-            logging.info("Step 2/7: Fetching attestation report...")
+            # 2. Fresh nonce + real X25519 ephemeral pubkey, bound into report_data
             nonce = secrets.token_bytes(32)
             nonce_hash = hashlib.sha256(nonce).digest()
             if self._replay_cache.has_seen(nonce_hash):
                 raise AttestationError("nonce replay detected")
             self._replay_cache.record(nonce_hash)
-            ephemeral_pubkey_bytes = secrets.token_bytes(32)
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            eph = X25519PrivateKey.generate()
+            eph_pub = eph.public_key().public_bytes_raw()
+            # Binding tag MUST match krs_server.BIND_TAG / report_data_for().
             report_data = hashlib.sha256(
-                ephemeral_pubkey_bytes + nonce +
-                b"v1" +
-                hashlib.sha256(str(self._output_dir).encode()).digest()
-            ).digest()
+                eph_pub + nonce + b"botsmaster-snp-binding-v1").digest()
             report = attestation.fetch_attestation_report(report_data)
-            logging.info("  Report: %d bytes", len(report))
+            logging.info("attestation report: %d bytes", len(report))
 
-            # Step 3: Verify attestation (local or via key service)
-            logging.info("Step 3/7: Verifying attestation...")
-            if self._key_service_url:
-                logging.info("  Using external key-release service: %s", self._key_service_url)
-                session_key, measurement = attestation.verify_via_key_service(
-                    report, self._key_service_url, nonce
+            # 3. Verify + obtain master key
+            if self._production:
+                if not (self._key_service_url and self._krs_config):
+                    raise AttestationError(
+                        "production refuses the local attestation path: a KRS "
+                        "(--key-service-url + mTLS pins) is required.")
+                if self._expected_measurement is None:
+                    raise AttestationError(
+                        "production requires --expected-measurement (allowlist)")
+                # 3a. local chain/policy/TCB/measurement/report_data verify (snpguest)
+                verifier = snp_verify.SnpVerifier(
+                    processor=self._krs_config.get("processor", "milan"),
+                    measurement_allowlist=[self._expected_measurement],
+                    min_reported_tcb=self._min_tcb,
                 )
-                logging.info("  Key service verified: measurement=%s", measurement[:8].hex())
-            elif self._expected_measurement:
-                attestation.verify_attestation_report(report, self._expected_measurement, nonce)
-                measurement = attestation.measurement
-                logging.info("  Local verification: measurement match confirmed")
+                verifier.verify(report, report_data)
+                # 3b. KRS independently verifies + Nitrokey touch, returns the key
+                krs = krs_client.KrsClient(
+                    self._key_service_url,
+                    client_cert=self._krs_config["client_cert"],
+                    client_key=self._krs_config["client_key"],
+                    pinned_ca=self._krs_config["pinned_ca"],
+                    pinned_server_fpr=self._krs_config["pinned_server_fpr"],
+                    krs_signing_pub=self._krs_config["krs_signing_pub"],
+                    server_name=self._krs_config["server_name"],
+                )
+                cek, measurement = attestation.verify_via_key_service(
+                    report, krs, eph)
+                self._master_key = ProtectedMemory(32)
+                self._master_key.write(cek[:32])
+                logging.info("KRS released session key; measurement=%s",
+                             measurement[:8].hex())
             else:
-                raise AttestationError(
-                    "No expected measurement or key service URL provided. "
-                    "Cannot verify attestation. Provide --expected-measurement or --key-service-url."
-                )
+                # Dev path (bare metal w/ Nitrokey attached). Refused in prod.
+                if self._expected_measurement is None:
+                    raise AttestationError("dev mode needs --expected-measurement")
+                attestation.verify_attestation_report(
+                    report, self._expected_measurement, nonce)
+                measurement = attestation.measurement
+                logging.warning("DEV verification (no cert chain, local Nitrokey)")
+                nitrokey = NitrokeyRoT(self._cred_dir)
+                nitrokey.detect(); nitrokey.load_credential()
+                hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
+                self._master_key = derive_master_key(measurement, hmac_secret)
 
-            # Step 4: Derive Nitrokey hmac-secret (touch required)
-            logging.info("Step 4/7: Nitrokey FIDO2 — TOUCH REQUIRED")
-            nitrokey = NitrokeyRoT(self._cred_dir)
-            nitrokey.detect()
-            nitrokey.load_credential()
-            hmac_secret = nitrokey.derive_hmac_secret(challenge=measurement[:32])
-            logging.info("  hmac-secret derived (%d bytes)", len(hmac_secret))
-
-            # Step 5: Derive master key (TEE measurement + Nitrokey secret)
-            logging.info("Step 5/7: Deriving master key...")
-            self._master_key = derive_master_key(measurement, hmac_secret)
-            logging.info("  Master key: ProtectedMemory (%d bytes)", self._master_key.size)
-
-            # Step 6: Decrypt strategy package
-            logging.info("Step 6/7: Decrypting strategy package...")
-            result = subprocess.run(
+            # 4. tmpfs gate (production)
+            fstype = subprocess.run(
                 ["findmnt", "-T", str(self._output_dir), "-no", "FSTYPE"],
-                capture_output=True, text=True
-            )
-            is_tmpfs = "tmpfs" in result.stdout
-            if self._production and not is_tmpfs:
+                capture_output=True, text=True).stdout
+            if self._production and "tmpfs" not in fstype:
                 raise AttestationError("production requires tmpfs/LUKS output_dir")
-            n = decrypt_package(self._sealed_dir, self._master_key, self._output_dir)
-            logging.info("  Decrypted %d files", n)
+
+            # 5. Decrypt strategy package (Rust unwrap required in production)
+            n = decrypt_package(self._sealed_dir, self._master_key,
+                                self._output_dir, require_rust=self._production)
             if n == 0:
                 raise AttestationError("No .aesgcm files found in sealed directory")
+            logging.info("decrypted %d files", n)
 
-            # Step 7: Arm zeroizer + start continuous attestation
-            logging.info("Step 7/7: Arming zeroizer + starting continuous attestation...")
+            # 6. Arm zeroizer + continuous attestation
             self._zeroizer.arm()
-            monitor = ContinuousAttestationMonitor(self._zeroizer, attestation, measurement)
-            monitor.start()
+            ContinuousAttestationMonitor(self._zeroizer, attestation, measurement).start()
             logging.info("Bootstrap complete. Strategy decrypted. Attestation active.")
-
             return 0
 
         except AttestationError as e:
@@ -721,6 +729,8 @@ class CloudProtection:
             return 1
         except Exception as e:
             logging.critical("Unexpected error: %s", e, exc_info=True)
+            if self._master_key:
+                self._master_key.zeroise()
             return 1
 
 
@@ -737,6 +747,19 @@ def main():
     p.add_argument("--expected-measurement", help="Expected SEV measurement (hex)")
     p.add_argument("--check-only", action="store_true", help="Detect TEE and Nitrokey, then exit")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    # production + KRS mTLS pins
+    p.add_argument("--production", action="store_true",
+                   help="Fail-closed prod mode: requires KRS+mTLS, snpguest chain "
+                        "verification, tmpfs output, lockdown, Rust unwrap")
+    p.add_argument("--client-cert", help="mTLS client certificate (PEM)")
+    p.add_argument("--client-key", help="mTLS client private key (PEM)")
+    p.add_argument("--pinned-ca", help="Pinned KRS CA bundle (PEM) — not the public store")
+    p.add_argument("--pinned-server-fpr", help="Pinned KRS server cert SHA-256 (hex)")
+    p.add_argument("--krs-pubkey", help="KRS response-signing Ed25519 public key (hex)")
+    p.add_argument("--server-name", help="KRS TLS server name (SNI/host)")
+    p.add_argument("--processor", default="milan", help="AMD CPU model for VCEK (milan/genoa)")
+    p.add_argument("--min-tcb", type=lambda x: int(x, 0), default=0,
+                   help="Minimum acceptable reported_tcb (anti-rollback)")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -766,12 +789,31 @@ def main():
             logging.warning("Nitrokey: %s", e)
         return 0
 
+    krs_config = None
+    if args.production:
+        missing = [n for n, v in [
+            ("--client-cert", args.client_cert), ("--client-key", args.client_key),
+            ("--pinned-ca", args.pinned_ca), ("--pinned-server-fpr", args.pinned_server_fpr),
+            ("--krs-pubkey", args.krs_pubkey), ("--server-name", args.server_name),
+            ("--key-service-url", args.key_service_url)] if not v]
+        if missing:
+            p.error("production requires: " + ", ".join(missing))
+        krs_config = {
+            "client_cert": args.client_cert, "client_key": args.client_key,
+            "pinned_ca": args.pinned_ca, "pinned_server_fpr": args.pinned_server_fpr,
+            "krs_signing_pub": bytes.fromhex(args.krs_pubkey),
+            "server_name": args.server_name, "processor": args.processor,
+        }
+
     cp = CloudProtection(
         sealed_dir=Path(args.sealed_dir),
         output_dir=Path(args.output_dir),
         cred_dir=Path(args.cred_dir),
         key_service_url=args.key_service_url,
         expected_measurement=expected,
+        production=args.production,
+        krs_config=krs_config,
+        min_tcb=args.min_tcb,
     )
     code = cp.bootstrap()
     if code == 0:

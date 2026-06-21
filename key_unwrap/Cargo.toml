@@ -1,0 +1,20 @@
+[package]
+name = "key_unwrap"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy-ish AES-256-GCM key/secret unwrap for the ASE confidential bootstrap. Compiled to a cdylib called from Python via ctypes so the master key and derived subkey are handled in Rust with explicit zeroization, not GC-managed Python bytes."
+
+[lib]
+name = "key_unwrap"
+crate-type = ["cdylib"]
+
+[dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+zeroize = "=1.8.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"

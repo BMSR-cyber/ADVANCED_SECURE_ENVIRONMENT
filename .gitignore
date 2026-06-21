@@ -1,0 +1,9 @@
+# Rust build artifacts
+key_unwrap/target/
+# Python caches
+**/__pycache__/
+*.pyc
+# fetched AMD certs / decrypted output / sealed scratch
+src/**/snp_certs_*/
+decrypted/
+live/
