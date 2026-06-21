@@ -289,14 +289,14 @@ class TEEAttestation:
         self._report_raw = report
 
     def verify_via_key_service(self, report: bytes, krs: "krs_client.KrsClient",
-                               eph_priv) -> Tuple[bytes, bytes]:
+                               eph_priv, kem) -> Tuple[bytes, bytes]:
         """Release the CEK via the mTLS+pinned KRS client.
 
         The KRS independently verifies the AMD cert chain, measurement, policy
-        and gates on a Nitrokey touch; it ECDH-wraps the CEK to `eph_priv`'s
-        attested public half and signs the response with its pinned Ed25519 key
-        (both checked inside krs.release)."""
-        cek, measurement = krs.release(report, eph_priv, self.tee_type)
+        and gates on a Nitrokey touch; it HYBRID-wraps the CEK (X25519+ML-KEM)
+        to `eph_priv`/`kem`'s attested public halves and HYBRID-signs the
+        response (Ed25519+ML-DSA), both checked inside krs.release()."""
+        cek, measurement = krs.release(report, eph_priv, kem, self.tee_type)
         self._tee_type = self.tee_type
         self._measurement = measurement
         self._report_raw = report
@@ -649,11 +649,14 @@ class CloudProtection:
                 raise AttestationError("nonce replay detected")
             self._replay_cache.record(nonce_hash)
             from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            import pqc
             eph = X25519PrivateKey.generate()
             eph_pub = eph.public_key().public_bytes_raw()
-            # Binding tag MUST match krs_server.BIND_TAG / report_data_for().
+            kem = pqc.KemPrivate()          # attested ephemeral ML-KEM-768
+            # Binding tag MUST match krs_server.BIND_TAG / report_data_for():
+            # sha256(client_x_pub || client_kem_pub || nonce || TAG).
             report_data = hashlib.sha256(
-                eph_pub + nonce + b"botsmaster-snp-binding-v1").digest()
+                eph_pub + kem.public + nonce + b"botsmaster-snp-binding-v2-hybrid").digest()
             report = attestation.fetch_attestation_report(report_data)
             logging.info("attestation report: %d bytes", len(report))
 
@@ -681,10 +684,11 @@ class CloudProtection:
                     pinned_ca=self._krs_config["pinned_ca"],
                     pinned_server_fpr=self._krs_config["pinned_server_fpr"],
                     krs_signing_pub=self._krs_config["krs_signing_pub"],
+                    krs_mldsa_pub=self._krs_config["krs_mldsa_pub"],
                     server_name=self._krs_config["server_name"],
                 )
                 cek, measurement = attestation.verify_via_key_service(
-                    report, krs, eph)
+                    report, krs, eph, kem)
                 self._master_key = ProtectedMemory(32)
                 self._master_key.write(cek[:32])
                 logging.info("KRS released session key; measurement=%s",
@@ -756,6 +760,7 @@ def main():
     p.add_argument("--pinned-ca", help="Pinned KRS CA bundle (PEM) — not the public store")
     p.add_argument("--pinned-server-fpr", help="Pinned KRS server cert SHA-256 (hex)")
     p.add_argument("--krs-pubkey", help="KRS response-signing Ed25519 public key (hex)")
+    p.add_argument("--krs-mldsa-pubkey", help="KRS response-signing ML-DSA-65 public key (hex)")
     p.add_argument("--server-name", help="KRS TLS server name (SNI/host)")
     p.add_argument("--processor", default="milan", help="AMD CPU model for VCEK (milan/genoa)")
     p.add_argument("--min-tcb", type=lambda x: int(x, 0), default=0,
@@ -794,7 +799,8 @@ def main():
         missing = [n for n, v in [
             ("--client-cert", args.client_cert), ("--client-key", args.client_key),
             ("--pinned-ca", args.pinned_ca), ("--pinned-server-fpr", args.pinned_server_fpr),
-            ("--krs-pubkey", args.krs_pubkey), ("--server-name", args.server_name),
+            ("--krs-pubkey", args.krs_pubkey), ("--krs-mldsa-pubkey", args.krs_mldsa_pubkey),
+            ("--server-name", args.server_name),
             ("--key-service-url", args.key_service_url)] if not v]
         if missing:
             p.error("production requires: " + ", ".join(missing))
@@ -802,6 +808,7 @@ def main():
             "client_cert": args.client_cert, "client_key": args.client_key,
             "pinned_ca": args.pinned_ca, "pinned_server_fpr": args.pinned_server_fpr,
             "krs_signing_pub": bytes.fromhex(args.krs_pubkey),
+            "krs_mldsa_pub": bytes.fromhex(args.krs_mldsa_pubkey),
             "server_name": args.server_name, "processor": args.processor,
         }
 

@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 import krs_server
 import krs_client
+import pqc
 
 
 def _name(cn): return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
@@ -73,9 +74,10 @@ def main() -> int:
     os.environ["BMSR_CEK_HEX"] = cek.hex()
     sign_key = Ed25519PrivateKey.generate()
     krs_pub = sign_key.public_key().public_bytes_raw()
+    mldsa_pk, mldsa_sk = pqc.sig_generate()          # KRS PQC signing identity
 
-    cfg = krs_server.KrsConfig(signing_key=sign_key, cek=cek, verifier=None,
-                               production=False)
+    cfg = krs_server.KrsConfig(signing_key=sign_key, mldsa_sk=mldsa_sk, cek=cek,
+                               verifier=None, production=False)
     httpd = krs_server.serve(cfg, host="127.0.0.1", port=0,
                              server_cert=str(tmp / "localhost.pem"),
                              server_key=str(tmp / "localhost.key"),
@@ -84,43 +86,42 @@ def main() -> int:
     t = threading.Thread(target=httpd.serve_forever, daemon=True); t.start()
     time.sleep(0.2)
     try:
-        client = krs_client.KrsClient(
-            f"https://localhost:{port}/verify",
-            client_cert=str(tmp / "client.pem"), client_key=str(tmp / "client.key"),
-            pinned_ca=str(tmp / "ca.pem"), pinned_server_fpr=server_fpr,
-            krs_signing_pub=krs_pub, server_name="localhost")
+        def mk_client(fpr=server_fpr, edpub=krs_pub, mldsapub=mldsa_pk):
+            return krs_client.KrsClient(
+                f"https://localhost:{port}/verify",
+                client_cert=str(tmp / "client.pem"), client_key=str(tmp / "client.key"),
+                pinned_ca=str(tmp / "ca.pem"), pinned_server_fpr=fpr,
+                krs_signing_pub=edpub, krs_mldsa_pub=mldsapub, server_name="localhost")
 
-        eph = X25519PrivateKey.generate()
-        got, meas = client.release(b"\x00" * 1184, eph)
-        assert got == cek, "CEK did not round-trip through ECDH wrap/unwrap"
-        print("OK  full mTLS + ECDH CEK unwrap + signature verify")
+        got, meas = mk_client().release(b"\x00" * 1184, X25519PrivateKey.generate(),
+                                        pqc.KemPrivate())
+        assert got == cek, "CEK did not round-trip through hybrid wrap/unwrap"
+        print("OK  full mTLS + HYBRID (X25519+ML-KEM) CEK unwrap + hybrid sig verify")
         assert len(meas) == 48
         print("OK  measurement returned (dev placeholder, 48B)")
 
-        # negative: wrong pinned fingerprint must fail
-        bad = krs_client.KrsClient(
-            f"https://localhost:{port}/verify",
-            client_cert=str(tmp / "client.pem"), client_key=str(tmp / "client.key"),
-            pinned_ca=str(tmp / "ca.pem"), pinned_server_fpr="00" * 32,
-            krs_signing_pub=krs_pub, server_name="localhost")
+        # negative: wrong pinned fingerprint
         try:
-            bad.release(b"\x00" * 1184, X25519PrivateKey.generate())
+            mk_client(fpr="00" * 32).release(b"\x00" * 1184, X25519PrivateKey.generate(), pqc.KemPrivate())
             print("FAIL fingerprint pin not enforced"); return 1
         except krs_client.KrsError:
             print("OK  server cert pin enforced")
 
-        # negative: wrong KRS signing key must fail signature check
-        wrong = krs_client.KrsClient(
-            f"https://localhost:{port}/verify",
-            client_cert=str(tmp / "client.pem"), client_key=str(tmp / "client.key"),
-            pinned_ca=str(tmp / "ca.pem"), pinned_server_fpr=server_fpr,
-            krs_signing_pub=Ed25519PrivateKey.generate().public_key().public_bytes_raw(),
-            server_name="localhost")
+        # negative: wrong CLASSICAL signing key (Ed25519) -> hybrid verify fails
         try:
-            wrong.release(b"\x00" * 1184, X25519PrivateKey.generate())
-            print("FAIL KRS signature not verified"); return 1
+            mk_client(edpub=Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+                      ).release(b"\x00" * 1184, X25519PrivateKey.generate(), pqc.KemPrivate())
+            print("FAIL classical-half pin not enforced"); return 1
         except krs_client.KrsError:
-            print("OK  KRS response signature enforced")
+            print("OK  hybrid sig: classical (Ed25519) half enforced")
+
+        # negative: wrong PQC signing key (ML-DSA) -> hybrid verify fails
+        try:
+            mk_client(mldsapub=pqc.sig_generate()[0]
+                      ).release(b"\x00" * 1184, X25519PrivateKey.generate(), pqc.KemPrivate())
+            print("FAIL PQC-half pin not enforced"); return 1
+        except krs_client.KrsError:
+            print("OK  hybrid sig: post-quantum (ML-DSA) half enforced")
     finally:
         httpd.shutdown()
     print("\nALL KRS SELFTESTS PASSED")

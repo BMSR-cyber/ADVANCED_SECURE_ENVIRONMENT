@@ -94,6 +94,11 @@ Implemented in this pass (see also `docs/ASE_REVIEW.md` for the review that drov
 - [x] **Key unwrap moved to Rust** — `key_unwrap/` cdylib (HKDF-SHA512 + AES-256-GCM,
   key/subkey in `Zeroizing`); `rust_unwrap.py` ctypes binding; required in prod.
   Interop with the Python seal format tested (AAD + tamper rejected).
+- [x] **Hybrid post-quantum crypto** (`pqc.py`, `hybrid.py`): CEK wrap = X25519
+  **+ ML-KEM-768**; KRS/channel auth = Ed25519 **+ ML-DSA-65** (both required).
+  Secure if either half holds; symmetric layer already PQC-safe. TLS-transport PQC
+  migration documented in [`docs/PQC_TLS.md`](docs/PQC_TLS.md). Self-test proves
+  the hybrid wrap round-trips and each auth half is independently enforced.
 
 Still pending (need real hardware / ops):
 - [ ] End-to-end run-verify on GCP N2D SEV-SNP (ioctl + snpguest against a live PSP)
