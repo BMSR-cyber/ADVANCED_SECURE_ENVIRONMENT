@@ -71,3 +71,27 @@ under oqs-provider builds may be `x25519_mlkem768`.)
   PQC-capable CA/HSM.
 - **Crypto agility:** algorithm names are centralized in `pqc.py`
   (`KEM_ALG`/`SIG_ALG`) for a one-line swap as standards evolve.
+
+## VERIFIED (2026-06-28): live hybrid TLS 1.3 on OpenSSL 3.5
+
+A locally-built **OpenSSL 3.5.8** (`~/openssl-3.5`, native ML-KEM/ML-DSA — no provider needed) completes a
+full TLS 1.3 handshake over the standardized hybrid group:
+
+```
+$ OPENSSL_BIN=$HOME/openssl-3.5/bin/openssl bash src/pqc_tls_test.sh
+  PASS ML-DSA-65 (FIPS 204) signature
+  PASS ML-KEM-768 (FIPS 203) KEM
+  Negotiated TLS1.3 group: X25519MLKEM768
+  New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  PQC-TLS: LIVE HYBRID HANDSHAKE WORKING
+```
+
+Build (no system change, no SEV-SNP needed):
+```bash
+git clone --depth 1 -b openssl-3.5 https://github.com/openssl/openssl /tmp/openssl
+cd /tmp/openssl && ./Configure --prefix=$HOME/openssl-3.5 --openssldir=$HOME/openssl-3.5/ssl
+make -j"$(nproc)" && make install_sw
+```
+On stock OpenSSL 3.0.20, `X25519MLKEM768` does NOT negotiate via oqs-provider HEAD (alert 40); the test
+falls back to verifying the PQC algorithms/certs only. Production: ship a ≥3.5 toolchain (or matched
+oqs-provider) to the KRS host. App-layer crypto (`pqc.py`/`hybrid.py`) is already PQC-safe regardless.

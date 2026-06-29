@@ -59,9 +59,38 @@ class _ReplayCache:
             return True
 
 
+class _RateLimiter:
+    """KRS_POLICY.md §1.4 — fixed-window limiter: per-client (cert/IP) and global. Over-limit => HTTP 429
+    (distinct from a 403 attestation failure). Local; not shared across instances (acceptable per policy)."""
+    def __init__(self, per_client: int = 10, global_max: int = 1000, window: float = 60.0):
+        self.per_client, self.global_max, self.window = per_client, global_max, window
+        self._win: dict[bytes, list] = {}
+        self._g = [0, 0.0]
+        self._lock = threading.Lock()
+
+    def allow(self, key: bytes) -> bool:
+        import time
+        now = time.monotonic()
+        with self._lock:
+            if now - self._g[1] >= self.window:
+                self._g = [0, now]
+            if self._g[0] >= self.global_max:
+                return False
+            c = self._win.get(key)
+            if c is None or now - c[1] >= self.window:
+                c = [0, now]; self._win[key] = c
+            if c[0] >= self.per_client:
+                return False
+            if len(self._win) > 50_000:
+                self._win.clear(); self._win[key] = c
+            c[0] += 1; self._g[0] += 1
+            return True
+
+
 class KrsConfig:
     def __init__(self, *, signing_key: Ed25519PrivateKey, mldsa_sk: bytes,
-                 cek: bytes, verifier, production: bool):
+                 cek: bytes, verifier, production: bool,
+                 rate_per_client: int = 10, rate_global: int = 1000):
         self.signing_key = signing_key      # Ed25519 (classical auth half)
         self.mldsa_sk = mldsa_sk            # ML-DSA-65 (PQC auth half)
         if len(cek) != 32:
@@ -70,6 +99,7 @@ class KrsConfig:
         self.verifier = verifier
         self.production = production
         self.replay = _ReplayCache()
+        self.rate = _RateLimiter(per_client=rate_per_client, global_max=rate_global)
 
 
 def _make_handler(cfg: KrsConfig):
@@ -79,17 +109,32 @@ def _make_handler(cfg: KrsConfig):
         def log_message(self, *a):
             pass
 
-        def _deny(self):
-            body = json.dumps({"verified": False, "reason": "denied"}).encode()
-            self.send_response(403)
+        def _status(self, code, reason):
+            body = json.dumps({"verified": False, "reason": reason}).encode()
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def _deny(self):
+            self._status(403, "denied")
+
+        def _client_key(self) -> bytes:
+            """Identify the caller for rate-limiting: client-cert fingerprint if presented, else source IP."""
+            try:
+                der = self.connection.getpeercert(binary_form=True)
+                if der:
+                    return hashlib.sha256(der).digest()
+            except Exception:
+                pass
+            return ("ip:" + str(self.client_address[0])).encode()
+
         def do_POST(self):
             if self.path != "/verify":
                 return self._deny()
+            if not cfg.rate.allow(self._client_key()):
+                return self._status(429, "rate_limited")   # NOT 403 (per KRS_POLICY §1.4)
             try:
                 n = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(n))

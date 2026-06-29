@@ -100,12 +100,31 @@ Implemented in this pass (see also `docs/ASE_REVIEW.md` for the review that drov
   migration documented in [`docs/PQC_TLS.md`](docs/PQC_TLS.md). Self-test proves
   the hybrid wrap round-trips and each auth half is independently enforced.
 
+Verifiable off-hardware (no SEV-SNP host) — run `bash src/run_offhw_tests.sh`:
+- [x] **Fail-closed attestation suite** (`src/snp_failclosed_test.py` + `src/snp_fakereport.py`): the
+  trust-critical field logic in `SnpVerifier.verify()` rejects replayed/stale quotes (report_data
+  mismatch), bad image digest (measurement not allowlisted), rolled-back TCB, DEBUG/SMT policy, and a
+  truncated report; and **fails closed when the AMD chain can't be verified** (snpguest absent). Only the
+  VCEK→ASK→ARK chain step is mocked (it needs hardware). Locks in the 0x090 MEASUREMENT offset fix.
+- [x] **KRS channel + crypto** (`src/krs_selftest.py`): full mTLS + hybrid X25519+ML-KEM-768 CEK unwrap +
+  Ed25519/ML-DSA-65 auth (both halves independently enforced), server-cert pinning.
+- [x] **KRS server policy enforcement** (`src/krs_policy_test.py`): drives the reference KRS in PRODUCTION
+  mode against synthetic attested reports (chain mocked) — valid→200, bad image digest→403, rolled-back
+  TCB→403, replayed nonce→403, **rate limit→429** (KRS_POLICY §1.4, now implemented in `krs_server.py`).
+- [x] **PQC-TLS — live hybrid handshake working** (`src/pqc_tls_test.sh`): on a locally-built OpenSSL 3.5
+  (native ML-KEM/ML-DSA, no provider) a full TLS 1.3 handshake negotiates **`X25519MLKEM768`**
+  (`Negotiated TLS1.3 group: X25519MLKEM768`, `TLS_AES_256_GCM_SHA384`). On stock OpenSSL 3.0.20 the test
+  falls back to verifying the oqs-provider PQC algorithms/certs (the live handshake needs ≥3.5). Point the
+  test at the new build with `OPENSSL_BIN=$HOME/openssl-3.5/bin/openssl`.
+
 Still pending (need real hardware / ops):
 - [ ] End-to-end run-verify on GCP N2D SEV-SNP (ioctl + snpguest against a live PSP)
-- [ ] Reference **KRS server** implementing `KRS_POLICY.md` (client side done)
 - [ ] RFC 9266 tls-exporter channel binding (needs Python 3.13+; cert-fpr binding used now)
 - [ ] Plaintext strategy on tmpfs/LUKS confirmed on the deployed image
-- [ ] Fail-closed suite on hardware: replayed quote, wrong TCB, bad image digest, bad KRS identity
+- [ ] Re-run the fail-closed + KRS-policy suites **on hardware** with real signed reports (logic proven off-hardware)
+- [x] **PQC-TLS live hybrid handshake — DONE** on locally-built OpenSSL 3.5 (`X25519MLKEM768` negotiates).
+  Remaining: deploy a ≥3.5 (or matched oqs-provider) toolchain to the KRS host so production TLS uses it
+  (app-layer crypto is already PQC-safe, so this is transport defense-in-depth).
 
 ## Side-Channel Hardening (priority order)
 
@@ -118,7 +137,9 @@ The next threat layer is observable behavior → inferred strategy/keys:
 5. **[ ] KRS mTLS/HPKE with pinned identity** — Documented design, not yet implemented.
 6. **[ ] SMT/co-tenancy** — Prefer no-sibling-sharing instances, dedicated KRS host.
 7. **[ ] Key unwrap → Rust/Go/C** — Python stays as orchestrator only.
-8. **[ ] Fail-closed test suite** — Replayed quote, wrong TCB, bad image digest, tampered ciphertext, bad KRS identity all fail closed.
+8. **[x] Fail-closed test suite** — replayed quote, wrong TCB, bad image digest, DEBUG/SMT policy,
+   truncation, and chain-unverifiable all fail closed off-hardware (`src/snp_failclosed_test.py`); tampered
+   ciphertext + bad KRS identity covered by `krs_selftest.py`. On-hardware re-run with real reports pending.
 
 Full hardening plan: `src/SIDE_CHANNEL_HARDENING.md`
 
